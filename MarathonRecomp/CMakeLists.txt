@@ -54,7 +54,7 @@ function(BIN2C)
     target_sources(${BIN2C_ARGS_TARGET_OBJ} PRIVATE "${BIN2C_ARGS_DEST_FILE}.c" "${BIN2C_ARGS_DEST_FILE}.h")
 endfunction()
 
-add_compile_options(
+set(MARATHON_CLANG_COMPILE_OPTIONS
     -fno-strict-aliasing
     -Wno-switch
     -Wno-unused-function
@@ -67,17 +67,18 @@ add_compile_options(
     -Wno-null-conversion
     -Wno-tautological-undefined-compare
 )
+add_compile_options($<$<NOT:$<COMPILE_LANGUAGE:Swift>>:${MARATHON_CLANG_COMPILE_OPTIONS}>)
 
 if (WIN32)
-    add_compile_options(/fp:strict)
+    add_compile_options($<$<NOT:$<COMPILE_LANGUAGE:Swift>>:/fp:strict>)
 else()
-    add_compile_options(-ffp-model=strict)
+    add_compile_options($<$<NOT:$<COMPILE_LANGUAGE:Swift>>:-ffp-model=strict>)
 endif()
 
 add_compile_definitions(
-    SDL_MAIN_HANDLED
-    _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR # Microsoft wtf?
-    _CRT_SECURE_NO_WARNINGS)
+    $<$<NOT:$<COMPILE_LANGUAGE:Swift>>:SDL_MAIN_HANDLED>
+    $<$<NOT:$<COMPILE_LANGUAGE:Swift>>:_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR> # Microsoft wtf?
+    $<$<NOT:$<COMPILE_LANGUAGE:Swift>>:_CRT_SECURE_NO_WARNINGS>)
 
 set(MARATHON_RECOMP_PRECOMPILED_HEADERS
     "stdafx.h"
