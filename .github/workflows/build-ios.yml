@@ -188,6 +188,23 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}/thirdparty/vcpkg
         run: |
+          # CMake expands semicolon-separated lists inside a generator expression into
+          # an invalid Xcode compiler argument. Emit one expression per compile option.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cmake_file = Path("MarathonRecomp/CMakeLists.txt")
+          source = cmake_file.read_text()
+          old = "add_compile_options($<$<NOT:$<COMPILE_LANGUAGE:Swift>>:${MARATHON_CLANG_COMPILE_OPTIONS}>)"
+          new = """foreach(MARATHON_CLANG_COMPILE_OPTION IN LISTS MARATHON_CLANG_COMPILE_OPTIONS)
+              add_compile_options(\"$<$<NOT:$<COMPILE_LANGUAGE:Swift>>:${MARATHON_CLANG_COMPILE_OPTION}>\")
+          endforeach()"""
+          if old not in source:
+              raise SystemExit("Expected CMake compile-options line was not found; refusing to continue")
+          cmake_file.write_text(source.replace(old, new, 1))
+          PY
+
+          rm -rf ./out/build/ios-xcode
           cmake -S . -B ./out/build/ios-xcode \
             -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
