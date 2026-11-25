@@ -66,19 +66,6 @@ index a9f21f8152..b75fab58f2 100644
 
      /* subtitle codecs */
      {
-diff --git a/libavcodec/codec_id.h b/libavcodec/codec_id.h
-index 6529f0a6bc..e68ede90d4 100644
---- a/libavcodec/codec_id.h
-+++ b/libavcodec/codec_id.h
-@@ -566,6 +566,8 @@ enum AVCodecID {
-     AV_CODEC_ID_LC3,
-     AV_CODEC_ID_G728,
-     AV_CODEC_ID_AHX,
-+    AV_CODEC_ID_XMAFRAMES,
-+
-
-     /* subtitle codecs */
-     AV_CODEC_ID_FIRST_SUBTITLE = 0x17000,          ///< A dummy ID pointing at the start of subtitle codecs.
 diff --git a/libavcodec/wmaprodec.c b/libavcodec/wmaprodec.c
 index dd33c56e54..1577b3f279 100644
 --- a/libavcodec/wmaprodec.c

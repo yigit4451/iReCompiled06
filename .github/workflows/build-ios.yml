@@ -106,6 +106,15 @@ jobs:
             pushd "${RUNNER_TEMP}/ffmpeg-src"
             # AV_CODEC_ID_XMAFRAMES is not in upstream FFmpeg; apply the sonicnext-dev patch.
             patch -p1 < "${GITHUB_WORKSPACE}/patches/ffmpeg-xmaframes.patch"
+            # codec_id.h differs between FFmpeg releases, so add the enum entry directly.
+            python3 - <<'PY'
+          import re
+          p = "libavcodec/codec_id.h"
+          s = open(p).read()
+          s, n = re.subn(r"(\n\s*/\* subtitle codecs \*/)", "\n    AV_CODEC_ID_XMAFRAMES,\n\\1", s, count=1)
+          assert n == 1
+          open(p, "w").write(s)
+          PY
             ./configure \
               --prefix="${FFMPEG_PREFIX}" \
               --enable-cross-compile \
