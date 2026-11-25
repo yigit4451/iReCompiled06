@@ -182,6 +182,10 @@ void init()
 #include <MarathonCore.h>
 #ifdef MARATHON_RECOMP_IOS
 #include <os/ios/sandbox_ios.h>
+#ifndef SDL_MAIN_HANDLED
+#define SDL_MAIN_HANDLED
+#endif
+#include <SDL3/SDL_main.h>
 #endif
 
 extern "C" MARATHON_CORE_API const char* MarathonGetDocumentsPath(void)
