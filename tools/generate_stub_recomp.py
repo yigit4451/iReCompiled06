@@ -142,19 +142,23 @@ def main() -> None:
         recomp_lines.append("    (void)base;")
         recomp_lines.append("}")
         recomp_lines.append("")
-        if sub_name not in defined_syms:
-            recomp_lines.append(f"PPC_WEAK_FUNC({sub_name}) {{")
-            recomp_lines.append(f"    __imp__{sub_name}(ctx, base);")
-            recomp_lines.append("}")
-            recomp_lines.append("")
+        # Always provide weak fallback wrappers. The source scanner cannot
+        # reliably distinguish every real definition form; a strong project
+        # definition overrides this weak one, while omitted symbols otherwise
+        # leave PPCFuncMappings with unresolved references at link time.
+        recomp_lines.append(f"PPC_WEAK_FUNC({sub_name}) {{")
+        recomp_lines.append(f"    __imp__{sub_name}(ctx, base);")
+        recomp_lines.append("}")
+        recomp_lines.append("")
 
     for imp_name in sorted_imps:
-        if imp_name not in defined_syms:
-            recomp_lines.append(f"PPC_WEAK_FUNC({imp_name}) {{")
-            recomp_lines.append("    (void)ctx;")
-            recomp_lines.append("    (void)base;")
-            recomp_lines.append("}")
-            recomp_lines.append("")
+        # As above, weak fallback definitions are safe when a strong
+        # implementation exists and prevent unresolved import references.
+        recomp_lines.append(f"PPC_WEAK_FUNC({imp_name}) {{")
+        recomp_lines.append("    (void)ctx;")
+        recomp_lines.append("    (void)base;")
+        recomp_lines.append("}")
+        recomp_lines.append("")
 
     write_if_changed(args.ppc_out_dir / "ppc_recomp.0.cpp", "\n".join(recomp_lines))
 
