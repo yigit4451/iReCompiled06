@@ -115,6 +115,23 @@ jobs:
           assert n == 1
           open(p, "w").write(s)
           PY
+            # Register the decoder struct (appended instead of patched: context differs per release).
+            cat >> libavcodec/wmaprodec.c <<'CODEC'
+
+          const FFCodec ff_xmaframes_decoder = {
+              .p.name         = "xmaframes",
+              CODEC_LONG_NAME("Xbox Media Audio raw frames"),
+              .p.type         = AVMEDIA_TYPE_AUDIO,
+              .p.id           = AV_CODEC_ID_XMAFRAMES,
+              .priv_data_size = sizeof(WMAProDecodeCtx),
+              .init           = xmaframes_decode_init,
+              .close          = xmaframes_decode_end,
+              FF_CODEC_DECODE_CB(xmaframes_decode_packet),
+              .flush          = wmapro_flush,
+              .p.capabilities = AV_CODEC_CAP_DR1,
+              .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
+          };
+          CODEC
             ./configure \
               --prefix="${FFMPEG_PREFIX}" \
               --enable-cross-compile \
