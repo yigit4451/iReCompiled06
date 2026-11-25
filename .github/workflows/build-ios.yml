@@ -86,7 +86,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/ffmpeg-ios-arm64
-          key: ffmpeg-ios-arm64-7.1.1-xma-v1
+          key: ffmpeg-ios-arm64-7.1.1-xma-v2
 
       - name: Build Minimal iOS arm64 FFmpeg (XMA1/XMA2/XMAFrames)
         run: |
@@ -104,6 +104,8 @@ jobs:
             tar -xf "${RUNNER_TEMP}/ffmpeg.tar.xz" -C "${RUNNER_TEMP}/ffmpeg-src" --strip-components=1
 
             pushd "${RUNNER_TEMP}/ffmpeg-src"
+            # AV_CODEC_ID_XMAFRAMES is not in upstream FFmpeg; apply the sonicnext-dev patch.
+            patch -p1 < "${GITHUB_WORKSPACE}/patches/ffmpeg-xmaframes.patch"
             ./configure \
               --prefix="${FFMPEG_PREFIX}" \
               --enable-cross-compile \
