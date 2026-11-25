@@ -1,0 +1,779 @@
+#include "game_window.h"
+#include <gpu/video.h>
+#include <os/logger.h>
+#include <os/user.h>
+#include <os/version.h>
+#include <utils/unique_queue.h>
+#include <app.h>
+#include <functional>
+#include <sdl_listener.h>
+#include <stdafx.h>
+
+#if _WIN32
+#include <dwmapi.h>
+#include <shellscalingapi.h>
+#endif
+
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#include <res/images/game_icon_mac.png.h>
+#else
+#include <res/images/game_icon.bmp.h>
+#endif
+
+#define QUEUE_WINDOW_CMD(FUNCTION) \
+    g_commandQueue.Push(__LINE__, FUNCTION)
+
+static UniqueQueue<int, std::function<void()>> g_commandQueue{};
+
+static bool g_isFullscreenKeyReleased = true;
+static bool g_isResizing = false;
+
+static double g_lastCursorMotionTime{};
+
+static SDL_DisplayID GetDisplayID(int displayIndex)
+{
+    int displayCount = 0;
+    auto displays = SDL_GetDisplays(&displayCount);
+    SDL_DisplayID result = 0;
+
+    if (displays)
+    {
+        if (displayIndex >= 0 && displayIndex < displayCount)
+            result = displays[displayIndex];
+
+        SDL_free(displays);
+    }
+
+    return result;
+}
+
+static void OnWindowDisplayChanged()
+{
+    GameWindow::s_windowModes = GameWindow::GetDisplayModes(true, true);
+}
+
+bool Window_OnSDLEvent(void*, SDL_Event* event)
+{
+    if (ImGui::GetIO().BackendPlatformUserData != nullptr)
+        ImGui_ImplSDL3_ProcessEvent(event);
+
+    if (DispatchSDLEvent(event))
+        return true;
+
+    switch (event->type)
+    {
+#if defined(__APPLE__) && TARGET_OS_IOS
+        case SDL_EVENT_WILL_ENTER_BACKGROUND:
+        {
+            GameWindow::s_isFocused = false;
+            if (!App::s_isSaving)
+                Config::Save();
+            break;
+        }
+
+        case SDL_EVENT_DID_ENTER_FOREGROUND:
+        {
+            GameWindow::s_isFocused = true;
+            break;
+        }
+#endif
+
+        case SDL_EVENT_QUIT:
+        {
+            if (App::s_isSaving)
+                break;
+
+            App::Exit();
+
+            break;
+        }
+
+        case SDL_EVENT_KEY_DOWN:
+        {
+            switch (event->key.key)
+            {
+                // Toggle fullscreen on ALT+ENTER.
+                case SDLK_RETURN:
+                {
+                    if (!(event->key.mod & SDL_KMOD_ALT) || !g_isFullscreenKeyReleased)
+                        break;
+
+                    QUEUE_WINDOW_CMD([]()
+                    {
+                        Config::Fullscreen = GameWindow::SetFullscreen(!GameWindow::IsFullscreen());
+
+                        if (Config::Fullscreen)
+                        {
+                            Config::Monitor = GameWindow::GetDisplay();
+                        }
+                        else
+                        {
+                            Config::WindowState = GameWindow::SetMaximised(Config::WindowState == EWindowState::Maximised);
+                        }
+                    });
+
+                    // Block holding ALT+ENTER spamming window changes.
+                    g_isFullscreenKeyReleased = false;
+
+                    break;
+                }
+
+                // Restore original window dimensions on F2.
+                case SDLK_F2:
+                {
+                    QUEUE_WINDOW_CMD([]()
+                    {
+                        Config::Fullscreen = GameWindow::SetFullscreen(false);
+                        GameWindow::ResetDimensions();
+                    });
+
+                    break;
+                }
+
+                // Recentre window on F3.
+                case SDLK_F3:
+                {
+                    if (GameWindow::IsFullscreen())
+                        break;
+
+                    QUEUE_WINDOW_CMD([]()
+                    {
+                        GameWindow::SetDimensions(GameWindow::s_width, GameWindow::s_height);
+                    });
+
+                    break;
+                }
+            }
+
+            break;
+        }
+
+        case SDL_EVENT_KEY_UP:
+        {
+            switch (event->key.key)
+            {
+                // Allow user to input ALT+ENTER again.
+                case SDLK_RETURN:
+                    g_isFullscreenKeyReleased = true;
+                    break;
+            }
+
+            break;
+        }
+
+        case SDL_EVENT_MOUSE_MOTION:
+            g_lastCursorMotionTime = App::s_time;
+            SDL_ShowCursor();
+            break;
+
+        case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        {
+            if (event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION)
+            {
+                if (abs(event->gaxis.value) > 8000)
+                    SDL_HideCursor();
+            }
+            else
+            {
+                SDL_HideCursor();
+            }
+
+            break;
+        }
+
+        case SDL_EVENT_WINDOW_FOCUS_LOST:
+            GameWindow::s_isFocused = false;
+            SDL_ShowCursor();
+            break;
+
+        case SDL_EVENT_WINDOW_FOCUS_GAINED:
+            GameWindow::s_isFocused = true;
+            break;
+
+        case SDL_EVENT_WINDOW_RESTORED:
+            Config::WindowState = EWindowState::Normal;
+            break;
+
+        case SDL_EVENT_WINDOW_MAXIMIZED:
+            Config::WindowState = EWindowState::Maximised;
+            break;
+
+        case SDL_EVENT_WINDOW_RESIZED:
+            g_isResizing = true;
+            Config::WindowSize = -1;
+            GameWindow::s_width = event->window.data1;
+            GameWindow::s_height = event->window.data2;
+            GameWindow::SetTitle(fmt::format("{} - [{}x{}]", GameWindow::GetTitle(), GameWindow::s_width, GameWindow::s_height).c_str());
+            break;
+
+        case SDL_EVENT_WINDOW_MOVED:
+            GameWindow::s_x = event->window.data1;
+            GameWindow::s_y = event->window.data2;
+            break;
+
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+            OnWindowDisplayChanged();
+            break;
+
+        // TODO
+        // case SDL_EVENT_USER_PLAYER_CHAR:
+        //     GameWindow::s_playerCharacter = static_cast<EPlayerCharacter>(event->user.code);
+        //     GameWindow::SetIcon(GameWindow::s_playerCharacter);
+        //     break;
+    }
+
+    return false;
+}
+
+void GameWindow::Init(const char* sdlVideoDriver)
+{
+#ifdef __linux__
+    SDL_SetHint(SDL_HINT_APP_ID, "io.github.sonicnext_dev.marathonrecomp");
+#endif
+
+    if (sdlVideoDriver)
+        SDL_SetHint(SDL_HINT_VIDEO_DRIVER, sdlVideoDriver);
+
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO) && sdlVideoDriver)
+    {
+        LOGFN_ERROR("Failed to initialise the SDL video driver: \"{}\". Falling back to default.", sdlVideoDriver);
+        SDL_ResetHint(SDL_HINT_VIDEO_DRIVER);
+        SDL_InitSubSystem(SDL_INIT_VIDEO);
+    }
+
+    auto videoDriverName = SDL_GetCurrentVideoDriver();
+
+    if (videoDriverName)
+        LOGFN("SDL video driver: \"{}\"", videoDriverName);
+
+    static bool s_windowWatchAdded = false;
+    if (!s_windowWatchAdded)
+    {
+        SDL_AddEventWatch(Window_OnSDLEvent, s_pWindow);
+        s_windowWatchAdded = true;
+    }
+
+#ifdef _WIN32
+    SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+#endif
+
+    SetDimensions(Config::WindowWidth, Config::WindowHeight, Config::WindowX, Config::WindowY);
+
+    if (!IsPositionValid())
+        GameWindow::ResetDimensions();
+
+    s_pWindow = SDL_CreateWindow("Marathon Recompiled", s_width, s_height, GetWindowFlags());
+    SDL_SetWindowPosition(s_pWindow, s_x, s_y);
+
+    OnWindowDisplayChanged();
+
+    SetDisplay(Config::Monitor);
+    SetIcon();
+    SetTitle();
+
+    SDL_SetWindowMinimumSize(s_pWindow, k_minWidth, k_minHeight);
+
+#if defined(_WIN32)
+    s_renderWindow = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(s_pWindow), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+#elif defined(PLUME_SDL_VULKAN_ENABLED)
+    s_renderWindow = s_pWindow;
+#elif defined(__linux__)
+    s_renderWindow = {
+        (Display*)SDL_GetPointerProperty(SDL_GetWindowProperties(s_pWindow), SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr),
+        (Window)SDL_GetNumberProperty(SDL_GetWindowProperties(s_pWindow), SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0)
+    };
+#elif defined(__APPLE__)
+#if TARGET_OS_IOS
+    s_renderWindow.window = SDL_GetPointerProperty(SDL_GetWindowProperties(s_pWindow), SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, nullptr);
+#else
+    s_renderWindow.window = SDL_GetPointerProperty(SDL_GetWindowProperties(s_pWindow), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
+#endif
+    s_renderWindow.view = SDL_Metal_GetLayer(SDL_Metal_CreateView(s_pWindow));
+#else
+    static_assert(false, "Unknown platform.");
+#endif
+
+    ConfigurePlatformWindow();
+
+    SDL_ShowWindow(s_pWindow);
+
+#if defined(__APPLE__) && TARGET_OS_IOS
+    // On iOS, UIApplication is already active when SwiftUI launches MarathonMain, so SDL_EVENT_WINDOW_FOCUS_GAINED
+    // may have already passed before window creation; ensure HID::IsInputAllowed() is active immediately.
+    s_isFocused = true;
+#else
+    s_isFocused = (SDL_GetWindowFlags(s_pWindow) & SDL_WINDOW_INPUT_FOCUS) != 0;
+#endif
+}
+
+void GameWindow::Update()
+{
+    // Disable resizing on loading screens, as buffer
+    // resize is inoperable on the loading thread.
+    SDL_SetWindowResizable(s_pWindow, !App::s_isLoading);
+
+    // Execute window commands after loading is complete.
+    if (!App::s_isLoading && !g_commandQueue.Empty())
+    {
+        g_commandQueue.Front()();
+        g_commandQueue.Pop();
+    }
+
+    if (SDL_GetWindowRelativeMouseMode(s_pWindow))
+    {
+        SDL_HideCursor();
+    }
+    else
+    {
+        if (App::s_time - g_lastCursorMotionTime >= 2.0)
+            SDL_HideCursor();
+    }
+
+    if (!GameWindow::IsFullscreen() && !GameWindow::IsMaximised() && !s_isChangingDisplay)
+    {
+        Config::WindowX = GameWindow::s_x;
+        Config::WindowY = GameWindow::s_y;
+        Config::WindowWidth = GameWindow::s_width;
+        Config::WindowHeight = GameWindow::s_height;
+    }
+
+    if (g_isResizing)
+    {
+        SetTitle();
+        g_isResizing = false;
+    }
+
+    if (Video::s_needsResize)
+        s_isChangingDisplay = false;
+}
+
+SDL_Surface* GameWindow::GetIconSurface(void* pIcon, size_t iconSize)
+{
+    SDL_Surface* surface = nullptr;
+
+    static constexpr uint8_t PNG_MAGIC[4] = {0x89, 0x50, 0x4E, 0x47};
+    if (memcmp(pIcon, PNG_MAGIC, sizeof(PNG_MAGIC)) == 0) {
+        int width, height;
+        void* stbImage = stbi_load_from_memory(static_cast<const uint8_t *>(pIcon), static_cast<int>(iconSize),
+            &width, &height, nullptr, 4);
+        if (!stbImage)
+        {
+            LOGF_ERROR("Failed to parse icon PNG: {}", stbi_failure_reason());
+            return nullptr;
+        }
+
+        surface = SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
+        memcpy(surface->pixels, stbImage, width * height * 4);
+        stbi_image_free(stbImage);
+    } else {
+        auto io = SDL_IOFromMem(pIcon, iconSize);
+        surface = io ? SDL_LoadBMP_IO(io, true) : nullptr;
+    }
+
+    if (!surface)
+        LOGF_ERROR("Failed to load icon: {}", SDL_GetError());
+
+    return surface;
+}
+
+void GameWindow::SetIcon(void* pIcon, size_t iconSize)
+{
+    if (auto icon = GetIconSurface(pIcon, iconSize))
+    {
+        SDL_SetWindowIcon(s_pWindow, icon);
+        SDL_DestroySurface(icon);
+    }
+}
+
+void GameWindow::SetIcon(EPlayerCharacter player)
+{
+    // TODO: Per-character icons
+    switch (player) {
+        case EPlayerCharacter::Sonic:
+            break;
+        case EPlayerCharacter::Shadow:
+            break;
+        case EPlayerCharacter::Silver:
+            break;
+        case EPlayerCharacter::Blaze:
+            break;
+        case EPlayerCharacter::Amy:
+            break;
+        case EPlayerCharacter::Tails:
+            break;
+        case EPlayerCharacter::Rouge:
+            break;
+        case EPlayerCharacter::Knuckles:
+            break;
+    }
+
+    SetIcon(g_game_icon, sizeof(g_game_icon));
+}
+
+const char* GameWindow::GetTitle()
+{
+    if (Config::UseOfficialTitleOnTitleBar)
+        return "SONIC THE HEDGEHOG";
+
+    return "Marathon Recompiled";
+}
+
+void GameWindow::SetTitle(const char* title)
+{
+    SDL_SetWindowTitle(s_pWindow, title ? title : GetTitle());
+}
+
+void GameWindow::ConfigurePlatformWindow()
+{
+#ifdef _WIN32
+    if (os::user::IsDarkTheme())
+    {
+        auto version = os::version::GetOSVersion();
+
+        if (version.Major < 10 || version.Build <= 17763)
+            return;
+
+        auto flag = version.Build >= 18985
+            ? DWMWA_USE_IMMERSIVE_DARK_MODE
+            : 19; // DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1
+
+        const DWORD useImmersiveDarkMode = 1;
+        DwmSetWindowAttribute(s_renderWindow, flag, &useImmersiveDarkMode, sizeof(useImmersiveDarkMode));
+    }
+
+    const auto wcp = Config::DisableRoundedCorners
+        ? DWMWCP_DONOTROUND
+        : DWMWCP_ROUND;
+
+    DwmSetWindowAttribute(GameWindow::s_renderWindow, DWMWA_WINDOW_CORNER_PREFERENCE, &wcp, sizeof(wcp));
+#endif
+}
+
+bool GameWindow::IsFullscreen()
+{
+    return SDL_GetWindowFlags(s_pWindow) & SDL_WINDOW_FULLSCREEN;
+}
+
+bool GameWindow::SetFullscreen(bool isEnabled)
+{
+    if (isEnabled)
+    {
+        SDL_SetWindowFullscreenMode(s_pWindow, nullptr);
+        SDL_SetWindowFullscreen(s_pWindow, true);
+    }
+    else
+    {
+        SDL_SetWindowFullscreen(s_pWindow, false);
+
+        SetIcon(GameWindow::s_playerCharacter);
+        SetDimensions(Config::WindowWidth, Config::WindowHeight, Config::WindowX, Config::WindowY);
+        ConfigurePlatformWindow();
+    }
+
+    return isEnabled;
+}
+
+bool GameWindow::IsMaximised()
+{
+    return SDL_GetWindowFlags(s_pWindow) & SDL_WINDOW_MAXIMIZED;
+}
+
+EWindowState GameWindow::SetMaximised(bool isEnabled)
+{
+    if (isEnabled)
+    {
+        SDL_MaximizeWindow(s_pWindow);
+    }
+    else
+    {
+        SDL_RestoreWindow(s_pWindow);
+    }
+
+    return isEnabled
+        ? EWindowState::Maximised
+        : EWindowState::Normal;
+}
+
+SDL_Rect GameWindow::GetDimensions()
+{
+    SDL_Rect rect{};
+
+    SDL_GetWindowPosition(s_pWindow, &rect.x, &rect.y);
+    SDL_GetWindowSize(s_pWindow, &rect.w, &rect.h);
+
+    return rect;
+}
+
+void GameWindow::GetSizeInPixels(int *w, int *h)
+{
+    SDL_GetWindowSizeInPixels(s_pWindow, w, h);
+}
+
+void GameWindow::SetDimensions(int w, int h, int x, int y)
+{
+    s_width = w;
+    s_height = h;
+
+    const auto isCentredX = SDL_WINDOWPOS_ISCENTERED(x);
+    const auto isCentredY = SDL_WINDOWPOS_ISCENTERED(y);
+
+    if (isCentredX || isCentredY)
+    {
+        SDL_Rect bounds{};
+        SDL_DisplayID display = SDL_GetDisplayForWindow(s_pWindow);
+
+        if (!display)
+            display = SDL_GetPrimaryDisplay();
+
+        if (SDL_GetDisplayBounds(display, &bounds))
+        {
+            s_x = isCentredX
+                ? bounds.x + (bounds.w / 2 - s_width / 2)
+                : x;
+
+            s_y = isCentredY
+                ? bounds.y + (bounds.h / 2 - s_height / 2)
+                : y;
+        }
+        else
+        {
+            s_x = isCentredX ? 0 : x;
+            s_y = isCentredY ? 0 : y;
+        }
+    }
+    else
+    {
+        s_x = x;
+        s_y = y;
+    }
+
+    if (!s_pWindow)
+        return;
+
+    SDL_SetWindowSize(s_pWindow, s_width, s_height);
+    SDL_ResizeEvent(s_pWindow, s_width, s_height);
+
+    SDL_SetWindowPosition(s_pWindow, s_x, s_y);
+    SDL_MoveEvent(s_pWindow, s_x, s_y);
+}
+
+void GameWindow::ResetDimensions()
+{
+    SetDimensions(k_defaultWidth, k_defaultHeight);
+
+    Config::WindowX = s_x;
+    Config::WindowY = s_y;
+    Config::WindowWidth = s_width;
+    Config::WindowHeight = s_height;
+}
+
+SDL_WindowFlags GameWindow::GetWindowFlags()
+{
+    SDL_WindowFlags flags = SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+
+#if defined(__APPLE__) && TARGET_OS_IOS
+    flags |= SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS | SDL_WINDOW_METAL;
+#endif
+
+    if (Config::WindowState == EWindowState::Maximised)
+        flags |= SDL_WINDOW_MAXIMIZED;
+
+    if (Config::Fullscreen)
+        flags |= SDL_WINDOW_FULLSCREEN;
+
+#ifdef PLUME_SDL_VULKAN_ENABLED
+    flags |= SDL_WINDOW_VULKAN;
+#endif
+
+    return flags;
+}
+
+int GameWindow::GetDisplayCount()
+{
+    int result = 0;
+    auto displays = SDL_GetDisplays(&result);
+
+    if (!displays)
+    {
+        LOGF_ERROR("Failed to get display count: {}", SDL_GetError());
+        return 1;
+    }
+
+    SDL_free(displays);
+
+    return result;
+}
+
+int GameWindow::GetDisplay()
+{
+    auto displayID = SDL_GetDisplayForWindow(s_pWindow);
+    int displayCount = 0;
+    auto displays = SDL_GetDisplays(&displayCount);
+    int result = -1;
+
+    if (displays)
+    {
+        for (int i = 0; i < displayCount; i++)
+        {
+            if (displays[i] == displayID)
+            {
+                result = i;
+                break;
+            }
+        }
+
+        SDL_free(displays);
+    }
+
+    return result;
+}
+
+void GameWindow::SetDisplay(int displayIndex)
+{
+    if (!IsFullscreen())
+        return;
+
+    if (GetDisplay() == displayIndex)
+        return;
+
+    s_isChangingDisplay = true;
+
+    SDL_Rect bounds;
+
+    if (SDL_GetDisplayBounds(GetDisplayID(displayIndex), &bounds))
+    {
+        SetFullscreen(false);
+        SetDimensions(bounds.w, bounds.h, bounds.x, bounds.y);
+        SetFullscreen(true);
+    }
+    else
+    {
+        ResetDimensions();
+    }
+}
+
+std::vector<SDL_DisplayMode> GameWindow::GetDisplayModes(bool ignoreInvalidModes, bool ignoreRefreshRates)
+{
+    auto result = std::vector<SDL_DisplayMode>();
+    auto uniqueResolutions = std::set<std::pair<int, int>>();
+    auto displayID = GetDisplayID(GetDisplay());
+    auto modeCount = 0;
+    auto modes = SDL_GetFullscreenDisplayModes(displayID, &modeCount);
+
+    if (!modes)
+        return result;
+
+    for (int i = modeCount - 1; i >= 0; i--)
+    {
+        const SDL_DisplayMode& mode = *modes[i];
+
+        if (ignoreInvalidModes)
+        {
+            if (mode.w < k_minWidth || mode.h < k_minHeight)
+                continue;
+
+            auto desktopMode = SDL_GetDesktopDisplayMode(displayID);
+
+            if (desktopMode && (mode.w >= desktopMode->w || mode.h >= desktopMode->h))
+                continue;
+        }
+
+        if (ignoreRefreshRates)
+        {
+            auto res = std::make_pair(mode.w, mode.h);
+
+            if (uniqueResolutions.find(res) == uniqueResolutions.end())
+            {
+                uniqueResolutions.insert(res);
+                result.push_back(mode);
+            }
+        }
+        else
+        {
+            result.push_back(mode);
+        }
+    }
+
+    SDL_free(modes);
+
+    return result;
+}
+
+int GameWindow::FindNearestDisplayMode(const std::vector<SDL_DisplayMode>& displayModes)
+{
+    int result = -1;
+    int smallestDiff{};
+
+    for (int i = 0; i < displayModes.size(); i++)
+    {
+        const auto& mode = displayModes[i];
+
+        const auto widthDiff = abs(mode.w - s_width);
+        const auto heightDiff = abs(mode.h - s_height);
+        const auto currentDiff = widthDiff + heightDiff;
+
+        // Display mode matches exact resolution.
+        if (!currentDiff)
+        {
+            result = i;
+            break;
+        }
+
+        if (currentDiff < smallestDiff)
+        {
+            smallestDiff = currentDiff;
+            result = i;
+        }
+    }
+
+    return result;
+}
+
+int GameWindow::FindNearestDisplayMode(bool ignoreInvalidModes, bool ignoreRefreshRates)
+{
+    return FindNearestDisplayMode(GetDisplayModes(ignoreInvalidModes, ignoreRefreshRates));
+}
+
+int GameWindow::FindNearestWindowMode()
+{
+    return FindNearestDisplayMode(s_windowModes);
+}
+
+bool GameWindow::IsPositionValid()
+{
+    bool result{};
+
+    int displayCount{};
+    const auto displays = SDL_GetDisplays(&displayCount);
+
+    if (!displays)
+        return result;
+
+    for (int i = 0; i < displayCount; i++)
+    {
+        SDL_Rect bounds{};
+
+        if (!SDL_GetDisplayBounds(displays[i], &bounds))
+            continue;
+
+        if (s_x >= bounds.x && s_x < bounds.x + bounds.w &&
+            s_y >= bounds.y && s_y < bounds.y + bounds.h)
+        {
+            // Window covers the display in windowed mode, which is invalid.
+            if (!Config::Fullscreen && s_width == bounds.w && s_height == bounds.h)
+                break;
+
+            result = true;
+
+            break;
+        }
+    }
+
+    SDL_free(displays);
+
+    return result;
+}

@@ -1,0 +1,5 @@
+module MarathonCore {
+    header "MarathonCore.h"
+    header "MarathonInstallerBridge.h"
+    export *
+}

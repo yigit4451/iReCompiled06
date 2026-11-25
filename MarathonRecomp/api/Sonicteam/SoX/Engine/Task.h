@@ -1,0 +1,135 @@
+#pragma once
+
+#include <functional>
+
+#include <Marathon.inl>
+#include <Sonicteam/SoX/Component.h>
+#include <Sonicteam/SoX/LinkNeighbor.h>
+#include <Sonicteam/SoX/LinkNode.h>
+#include <Sonicteam/SoX/MessageReceiver.h>
+
+namespace Sonicteam::SoX::Engine
+{
+    class Doc;
+
+    class Task : public Component, public MessageReceiver
+    {
+    public:
+        struct Vftable : public Component::Vftable {};
+
+        uint8_t m_Flags;
+        MARATHON_INSERT_PADDING(0x03);
+        be<uint32_t> m_Timestamp;
+        LinkNeighbor<Task> m_Siblings;
+        xpointer<Task> m_pDependency;
+        xpointer<Task> m_pDependencies;
+        xpointer<Doc> m_pDoc;
+        LinkNode<Task> m_lnTask;
+
+        template <typename T = Task>
+        T* Find(const char* in_pName)
+        {
+            T* result{};
+
+            Walk([&](Task* in_pNode) -> bool
+            {
+                if (strcmp(in_pNode->GetName(), in_pName) == 0)
+                {
+                    result = static_cast<T*>(in_pNode);
+                    return false;
+                }
+
+                return true;
+            });
+
+            return result;
+        }
+
+        Task* GetFirstDependency() const
+        {
+            if (!m_pDependencies)
+                return nullptr;
+
+            auto pCurrent = m_pDependencies.get();
+
+            while (pCurrent->m_Siblings.m_pPrev && pCurrent->m_Siblings.m_pPrev != m_pDependencies.get())
+                pCurrent = pCurrent->m_Siblings.m_pPrev.get();
+
+            return pCurrent;
+        }
+
+        Task* GetLastDependency() const
+        {
+            return m_pDependencies.get();
+        }
+
+        template <typename T = Doc>
+        T* GetDoc()
+        {
+            return (T*)m_pDoc.get();
+        }
+
+        void Walk(const std::function<bool(Task*)>& in_rVisitor, bool in_walkDependencies = true)
+        {
+            for (auto& rTask : *this)
+            {
+                if (!in_rVisitor(&rTask))
+                    break;
+
+                if (in_walkDependencies && rTask.m_pDependencies)
+                    rTask.m_pDependencies->Walk(in_rVisitor);
+            }
+        }
+
+        class iterator
+        {
+        private:
+            Task* m_pCurrent{};
+
+        public:
+            iterator(Task* in_pCurrent = nullptr) : m_pCurrent(in_pCurrent) {}
+
+            Task& operator*() const
+            {
+                return *m_pCurrent;
+            }
+
+            Task* operator->() const
+            {
+                return m_pCurrent;
+            }
+
+            iterator& operator++()
+            {
+                if (m_pCurrent)
+                    m_pCurrent = m_pCurrent->m_Siblings.m_pPrev.get();
+
+                return *this;
+            }
+
+            bool operator!=(const iterator& in_rOther) const
+            {
+                return m_pCurrent != in_rOther.m_pCurrent;
+            }
+        };
+
+        iterator begin()
+        {
+            return iterator(this);
+        }
+
+        iterator end()
+        {
+            return iterator(nullptr);
+        }
+    };
+
+    MARATHON_ASSERT_OFFSETOF(Task, m_Flags, 0x24);
+    MARATHON_ASSERT_OFFSETOF(Task, m_Timestamp, 0x28);
+    MARATHON_ASSERT_OFFSETOF(Task, m_Siblings, 0x2C);
+    MARATHON_ASSERT_OFFSETOF(Task, m_pDependency, 0x34);
+    MARATHON_ASSERT_OFFSETOF(Task, m_pDependencies, 0x38);
+    MARATHON_ASSERT_OFFSETOF(Task, m_pDoc, 0x3C);
+    MARATHON_ASSERT_OFFSETOF(Task, m_lnTask, 0x40);
+    MARATHON_ASSERT_SIZEOF(Task, 0x4C);
+}

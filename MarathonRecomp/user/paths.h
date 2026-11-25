@@ -1,0 +1,110 @@
+#pragma once
+
+#include <mod/mod_loader.h>
+
+#define USER_DIRECTORY "MarathonRecomp"
+
+#ifndef GAME_INSTALL_DIRECTORY
+#define GAME_INSTALL_DIRECTORY "."
+#endif
+
+extern std::filesystem::path g_executableRoot;
+inline std::unordered_map<std::string, std::filesystem::path> g_pathCache;
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IOS
+#include <os/ios/sandbox_ios.h>
+#endif
+#endif
+
+bool CheckPortable();
+std::filesystem::path BuildUserPath();
+const std::filesystem::path& GetUserPath();
+const std::filesystem::path& GetAppSupportPath();
+inline std::filesystem::path GetGamePath()
+{
+#if defined(__APPLE__) && TARGET_OS_IOS
+    // On iOS, game/DLC/mod content is stored in <Sandbox>/Documents/iReCompiled06 so users can
+    // manage files directly through the iOS Files app (UIFileSharingEnabled).
+    return os::ios::GetGameInstallPath();
+#elif defined(__APPLE__)
+    // On macOS, there is the expectation that the app may be installed to
+    // /Applications/, and the bundle should not be modified. Thus we need
+    // to install game files to the user directory instead of next to the app.
+    return GetUserPath();
+#elif defined(__linux__)
+    // On Linux, and some other Unix-like systems like FreeBSD, 
+    // following freedesktop's XDG Base Directory Specification is encouraged.
+    // https://specifications.freedesktop.org/basedir/latest/
+    // basically, user-specific files should be installed to a user-set variable of $XDG_DATA_HOME
+    // If $XDG_DATA_HOME is either not set or empty, a default of $HOME/.local/share should be used.
+    if (CheckPortable())
+    {
+        return GAME_INSTALL_DIRECTORY;
+    }
+    const char* homeDir = getenv("HOME");
+    if (homeDir == nullptr)
+    {
+        homeDir = getpwuid(getuid())->pw_dir;
+    }
+    std::filesystem::path homePath = "";
+    if (homeDir != nullptr) {
+        // Prefer to store in the .config directory if it exists. Use the home directory otherwise.
+        homePath = homeDir;
+    }
+    const char* dataDir = getenv("XDG_DATA_HOME");
+    std::filesystem::path dataPath = "";
+    if (dataDir != nullptr)
+    {
+        dataPath = dataDir;
+    } else
+    {
+        dataPath = homePath / ".local" / "share";
+    }
+    std::filesystem::path gamePath = dataPath / USER_DIRECTORY;
+    return gamePath;
+#else
+    return GAME_INSTALL_DIRECTORY;
+#endif
+}
+
+inline std::filesystem::path GetSavePath(bool checkForMods)
+{
+    if (checkForMods && !ModLoader::s_saveFilePath.empty())
+        return ModLoader::s_saveFilePath.parent_path();
+    else
+        return GetUserPath() / "save";
+}
+
+// Returned file name may not necessarily be
+// equal to SYS-DATA as mods can assign anything.
+inline std::filesystem::path GetSaveFilePath(bool checkForMods)
+{
+    if (checkForMods && !ModLoader::s_saveFilePath.empty())
+        return ModLoader::s_saveFilePath;
+    else
+        return GetSavePath(false) / "SonicNextSaveData.bin";
+}
+
+static std::string toLower(std::string str) {
+    std::transform(str.begin(), str.end(), str.begin(), [](unsigned char c) { return std::tolower(c); });
+    return str;
+};
+
+inline void BuildPathCache(const std::string& gamePath) {
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(gamePath)) {
+        std::string fullPath = entry.path().string();
+        std::string key = toLower(fullPath);
+        g_pathCache[key] = entry.path();
+    }
+}
+
+inline std::filesystem::path FindInPathCache(const std::string& targetPath) {
+    std::string key = toLower(targetPath);
+    auto it = g_pathCache.find(key);
+    if (it != g_pathCache.end()) {
+        return it->second;
+    }
+    return {};
+}

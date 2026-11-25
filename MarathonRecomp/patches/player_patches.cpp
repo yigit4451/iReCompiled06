@@ -1,0 +1,707 @@
+#include <api/Marathon.h>
+#include <cpu/guest_stack_var.h>
+#include <hid/message/messages.h>
+#include <hid/hid.h>
+#include <os/logger.h>
+#include <user/config.h>
+#include <app.h>
+
+void OnRegisterPlayerActor(PPCRegister& r25)
+{
+    const auto pObject = reinterpret_cast<Sonicteam::Player::Object*>(g_memory.Translate(r25.u32));
+
+    if (const auto pUser = HID::GetManager()->GetUser(pObject->GetPlayerIndex()))
+        pUser->BroadcastMessage<HID::MsgSetCharacterLED>(pObject->m_Name.c_str());
+}
+
+// Sonicteam::Player::State::TailsContext::Update
+PPC_FUNC_IMPL(__imp__sub_8221A7D8);
+PPC_FUNC(sub_8221A7D8)
+{
+    if (!Config::TailsGauge)
+    {
+        __imp__sub_8221A7D8(ctx, base);
+        return;
+    }
+
+    auto pTailsContext = (Sonicteam::Player::State::TailsContext*)(base + ctx.r3.u32);
+    auto pPlayer = pTailsContext->m_spScore->m_pPlayer;
+
+    if (auto pGauge = pPlayer->GetGauge<Sonicteam::Player::SonicGauge>())
+    {
+        pGauge->c_gauge_max = 100.0f;
+        pGauge->m_Value = (100.0f / pTailsContext->m_FlightDuration) * pTailsContext->m_FlightTime;
+    }
+
+    auto pTailsFlight = pPlayer->GetStateMachine<Sonicteam::Player::State::Machine2>()->GetState<Sonicteam::Player::State::TailsFlight>();
+    auto pGame = App::s_pApp->GetGame();
+
+    auto maturityValue = 1.0f;
+
+    // Set maturity value if the current state is Sonicteam::Player::State::TailsFlight.
+    if (pTailsFlight->m_pVftable.ptr == 0x82005404)
+        maturityValue = (1.0f / pTailsContext->m_FlightLimit) * pTailsFlight->m_FlightTime;
+
+    for (int i = 0; i < 4; i++)
+    {
+        if (pGame->m_PlayerData[i].ActorID == pPlayer->m_ActorID.get())
+            pGame->m_PlayerData[i].MaturityValue = maturityValue;
+    }
+
+    __imp__sub_8221A7D8(ctx, base);
+}
+
+// Sonicteam::Player::Score::Score
+PPC_FUNC_IMPL(__imp__sub_821E8C48);
+PPC_FUNC(sub_821E8C48)
+{
+    if (!Config::TailsGauge)
+    {
+        __imp__sub_821E8C48(ctx, base);
+        return;
+    }
+
+    auto pPlayer = (Sonicteam::Player::Object*)(base + ctx.r4.u32);
+
+    if (pPlayer->m_LuaFile == "player/tails.lua")
+    {
+        auto pSonicGauge = GuestToHostFunction<Sonicteam::Player::SonicGauge*>(sub_8223F208, g_userHeap.Alloc(sizeof(Sonicteam::Player::SonicGauge)));
+
+        guest_stack_var<boost::shared_ptr<Sonicteam::Player::IGauge>> spSonicGauge;
+
+        // Make shared pointer.
+        GuestToHostFunction<void>(sub_821BEAB0, spSonicGauge.get(), pSonicGauge);
+
+        // Add gauge plugin to player.
+        GuestToHostFunction<void>(sub_821BECE0, pPlayer, spSonicGauge.get(), 1);
+
+        pPlayer->m_spGauge = *spSonicGauge.get();
+    }
+
+    __imp__sub_821E8C48(ctx, base);
+}
+
+// Sonicteam::Player::Object::ProcMsgAmigoChange
+PPC_FUNC_IMPL(__imp__sub_8219A5B0);
+PPC_FUNC(sub_8219A5B0)
+{
+    const auto pAmigo = reinterpret_cast<Sonicteam::Player::Object*>(base + ctx.r3.u32);
+    const auto pMsgAmigoChange = static_cast<Sonicteam::Message::Player::MsgAmigoChange*>(reinterpret_cast<Sonicteam::SoX::IMessage*>(base + ctx.r4.u32));
+
+    if (const auto pPlayer = static_cast<Sonicteam::Player::Object*>(pMsgAmigoChange->pPlayer.get()))
+    {
+        if (const auto pUser = HID::GetManager()->GetUser(pPlayer->GetPlayerIndex()))
+            pUser->BroadcastMessage<HID::MsgSetCharacterLED>(pAmigo->m_Name.c_str());
+    }
+
+    __imp__sub_8219A5B0(ctx, base);
+}
+
+bool AlwaysExitVehicles()
+{
+    return Config::AlwaysExitVehicles;
+}
+
+bool AlwaysHaveHighSpeed()
+{
+    return Config::AlwaysHaveHighSpeed;
+}
+
+bool AlwaysHaveInvincibility()
+{
+    return Config::AlwaysHaveInvincibility;
+}
+
+bool ControllableBoundAttack()
+{
+    return Config::ControllableBoundAttack;
+}
+
+bool ControllableBoundAttack2(PPCCRRegister& cmp)
+{
+    if (Config::ControllableBoundAttack)
+        return !cmp.eq;
+
+    return cmp.eq;
+}
+
+bool ControllableHammerAttack()
+{
+    return Config::ControllableHammerAttack;
+}
+
+bool ControllableOmegaLauncher()
+{
+    return Config::ControllableOmegaLauncher;
+}
+
+bool ControllableOmegaLockOnShot()
+{
+    return Config::ControllableOmegaLockOnShot;
+}
+
+bool ControllablePsychoShock()
+{
+    return Config::ControllablePsychoShock;
+}
+
+bool ControllableSpinKick()
+{
+    return Config::ControllableSpinKick;
+}
+
+bool ControllableTeleportDash()
+{
+    return Config::ControllableTeleportDash;
+}
+
+// Sonicteam::Player::Sound::Sonic::Sonic
+PPC_FUNC_IMPL(__imp__sub_8226A478);
+PPC_FUNC(sub_8226A478)
+{
+    if (Config::ControllableTornadoAttack)
+    {
+        // Redirect unused air tornado sound to ground tornado sound.
+        // No need to recover this, as the cue is mute.
+        *reinterpret_cast<be<uint32_t>*>(base + 0x8200FCEC) = 0x8200E474; // "tornado_move" -> "tornado"
+    }
+
+    __imp__sub_8226A478(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_821A3118); // Sonicteam::Player::State::SonicTornadoAir::SonicTornadoAir
+PPC_FUNC_IMPL(__imp__sub_821A2F98); // Sonicteam::Player::State::SonicTornadoGround::SonicTornadoGround
+PPC_FUNC(sub_821A2F98)
+{
+    // Redirect ground state to air state.
+    if (Config::ControllableTornadoAttack)
+    {
+        __imp__sub_821A3118(ctx, base);
+        return;
+    }
+
+    __imp__sub_821A2F98(ctx, base);
+}
+
+bool ControllableTornadoAttack()
+{
+    return Config::ControllableTornadoAttack;
+}
+
+// Sonicteam::Player::State::CommonAmigo::Update
+PPC_FUNC_IMPL(__imp__sub_821A1B20);
+PPC_FUNC(sub_821A1B20)
+{
+    if (Config::DisableAmigoChangeCutscenes)
+        reinterpret_cast<Sonicteam::Player::State::CommonAmigo*>(base + ctx.r3.u32)->m_Time = 0.0f;
+
+    __imp__sub_821A1B20(ctx, base);
+}
+
+bool DisableAmigoChangeCutscenes()
+{
+    return Config::DisableAmigoChangeCutscenes;
+}
+
+PPC_FUNC_IMPL(__imp__sub_821B6B20); // Sonicteam::Player::State::ShadowHoming<1>::Update
+PPC_FUNC_IMPL(__imp__sub_821B66E8); // Sonicteam::Player::State::ShadowHoming<0>::Update
+PPC_FUNC(sub_821B66E8)
+{
+    // Redirect state update with attacks to one without.
+    if (Config::DisableChaosAttack)
+    {
+        __imp__sub_821B6B20(ctx, base);
+        return;
+    }
+
+    __imp__sub_821B66E8(ctx, base);
+}
+
+bool DisableClimbFromJump()
+{
+    return Config::DisableClimbFromJump;
+}
+
+bool DisableMidairSpinningClaw()
+{
+    return Config::DisableMidairSpinningClaw;
+}
+
+bool DisablePushState()
+{
+    return Config::DisablePushState;
+}
+
+bool DisableSandJump()
+{
+    return Config::DisableSandJump;
+}
+
+bool DisableSuperSwitchDelay()
+{
+    return Config::DisableSuperSwitchDelay;
+}
+
+void DisableSuperSwitchDelay2(PPCRegister& r11, PPCRegister& r4)
+{
+    if (!Config::DisableSuperSwitchDelay)
+        return;
+
+    r11.u64 = 0;
+    r4.u64 = 0x69;
+}
+
+void E3ChainJumpSpeed_SetJumpSpeed(PPCRegister& f0)
+{
+    if (!Config::E3ChainJumpSpeed)
+        return;
+
+    f0.f64 = 8000.0;
+}
+
+void E3ChainJumpSpeed_SetWaitTime(PPCRegister& f12)
+{
+    if (!Config::E3ChainJumpSpeed)
+        return;
+
+    f12.f64 = 0.0;
+}
+
+void E3RespawnTime(PPCRegister& f0)
+{
+    if (!Config::E3RespawnTime)
+        return;
+
+    f0.f64 = 1.5;
+}
+
+void FixOmegaShotCollision(PPCRegister& r6)
+{
+    if (!Config::FixOmegaShotCollision)
+        return;
+
+    r6.u32 = 0x1C80;
+}
+
+void IncreasedChaosBlastRange(PPCRegister& f0)
+{
+    if (!Config::IncreasedChaosBlastRange)
+        return;
+
+    f0.f64 = 2500.0;
+}
+
+void IncreasedHeatKnuckleRange(PPCRegister& f0)
+{
+    if (!Config::IncreasedHeatKnuckleRange)
+        return;
+
+    f0.f64 = 800.0;
+}
+
+bool MidairControlForMachSpeed()
+{
+    return Config::MidairControlForMachSpeed;
+}
+
+bool MidairControlForSnowboards()
+{
+    return Config::MidairControlForSnowboards;
+}
+
+void RestoreChaosBoostJump(PPCRegister& r10, PPCRegister& r11)
+{
+    if (!Config::RestoreChaosBoostJump)
+        return;
+
+    r10.u32 = 1;
+    r11.u32 = 2;
+}
+
+void RestoreChainJumpFlips(PPCRegister& r31, PPCRegister& r30, PPCRegister& r11, PPCRegister& f1, PPCRegister& f2, PPCRegister& f3)
+{
+    if (!Config::RestoreChainJumpFlips)
+        return;
+
+    struct Message
+    {
+        be<uint32_t> ID;
+        Sonicteam::SoX::Math::Quaternion Rotation;
+        Sonicteam::SoX::Math::Vector Position;
+        be<uint32_t> ActorID;
+    };
+
+    const auto pPlayer = reinterpret_cast<Sonicteam::Player::Object*>(g_memory.Translate(r31.u32));
+    const auto pMessage = reinterpret_cast<Message*>(g_memory.Translate(r30.u32));
+    const auto pPlayerContext = reinterpret_cast<Sonicteam::Player::State::ICommonContext*>(g_memory.Translate(r11.u32));
+    const auto pActorManager = pPlayer->m_pDoc->GetDocMode<Sonicteam::GameMode>()->GetGame()->m_spActorManager.get();
+
+    auto target = pMessage->Position;
+
+    if (pMessage->ActorID != -1)
+    {
+        const auto pFixture = GuestToHostFunction<Sonicteam::Fixture*>(sub_821609D0, pActorManager, &pMessage->ActorID);
+
+        auto msgGetNextPoint = guest_stack_var<Sonicteam::Message::ObjJump123::MsgGetNextPoint>();
+        msgGetNextPoint->Rotation = { 0, 0, 0, 1 };
+        msgGetNextPoint->Position = { 0, 0, 0, 1 };
+
+        if (pFixture->ProcessMessage(msgGetNextPoint.get()))
+            target = msgGetNextPoint->Position;
+    }
+
+    const auto magnitudeHorz = f1.f64;
+    const auto magnitudeForward = f2.f64;
+    const auto distance = pPlayer->m_spRootFrame->m_PositionF0.Distance(target);
+    const auto magnitude = std::sqrt(magnitudeHorz * magnitudeHorz + magnitudeForward * magnitudeForward);
+
+    auto time = 1.0;
+
+    if (distance > 0.0 && magnitude > 0.0)
+        time = distance / magnitude;
+
+    // CommonContext has a slightly different algorithm to process chain flips.
+    if (static_cast<Sonicteam::Player::IPlugIn*>(pPlayerContext)->m_pVftable.ptr != 0x8200A728)
+        time *= 0.35;
+
+    f3.f64 = time;
+}
+
+bool RestoreChaosSpearFlips()
+{
+    return Config::RestoreChaosSpearFlips;
+}
+
+bool RestoreHomingFlips(PPCCRRegister& cr6)
+{
+    return Config::RestoreHomingFlips
+        ? !cr6.gt
+        : !cr6.eq;
+}
+
+bool RestoreHomingGravity(PPCRegister& r1, PPCRegister& r4, PPCRegister& r5)
+{
+    if (!Config::RestoreHomingGravity)
+        return false;
+
+    const auto pResult = reinterpret_cast<Sonicteam::SoX::Math::Vector*>(g_memory.Translate(r1.u32 + 0x80));
+    const auto pVectorA = reinterpret_cast<Sonicteam::SoX::Math::Vector*>(g_memory.Translate(r4.u32));
+    const auto pVectorB = reinterpret_cast<Sonicteam::SoX::Math::Vector*>(g_memory.Translate(r5.u32));
+
+    *pResult = *pVectorA + *pVectorB;
+
+    return true;
+}
+
+void RestoreRingExplosionPhysics(PPCRegister& vec)
+{
+    if (!Config::RestoreRingExplosionPhysics)
+        return;
+
+    const auto pRingSpreadVector = reinterpret_cast<Sonicteam::SoX::Math::Vector*>(g_memory.Translate(vec.u32));
+
+    pRingSpreadVector->Y = 50.0f;
+    pRingSpreadVector->Z = 100.0f;
+}
+
+bool RestoreRotationInterpolation(PPCRegister& r28)
+{
+    if (!Config::RestoreRotationInterpolation)
+        return false;
+
+    r28.u32 = 1;
+
+    return true;
+}
+
+void RestoreRotationInterpolation2(PPCRegister& r10, PPCRegister& r31)
+{
+    if (!Config::RestoreRotationInterpolation)
+        return;
+
+    const auto base = g_memory.base;
+
+    r10.u64 = PPC_LOAD_U32(r31.u32 + 0x3F0);
+}
+
+void RestoreSilverBossThrow(PPCRegister& r12)
+{
+    if (!Config::RestoreSilverBossThrow)
+        return;
+
+    r12.u64 = 0;
+}
+
+bool SlidingAttackRetainsSpeed()
+{
+    return Config::SlidingAttackRetainsSpeed;
+}
+
+bool UnlimitedSlidingAttack()
+{
+    return Config::UnlimitedSlidingAttack;
+}
+
+bool UnlimitedSpinningClaw()
+{
+    return Config::UnlimitedSpinningClaw;
+}
+
+bool UnlockSnowboardControl(PPCRegister& r3)
+{
+    if (!Config::UnlockSnowboardControl)
+        return false;
+
+    r3.u32 = 1;
+
+    return true;
+}
+
+PPC_FUNC_IMPL(__imp__sub_82217FC0);
+PPC_FUNC(sub_82217FC0)
+{
+    if (!Config::RestoreSonicActionGauge)
+    {
+        __imp__sub_82217FC0(ctx, base);
+        return;
+    }
+
+    auto pSonicContext = (Sonicteam::Player::State::SonicContext*)(base + ctx.r3.u32);
+    auto pSonicGauge = pSonicContext->m_spGauge.get();
+
+    using enum Sonicteam::Player::State::SonicContext::Gem;
+
+    auto gemIndex = (Sonicteam::Player::State::SonicContext::Gem)ctx.r4.u32;
+
+    switch (gemIndex)
+    {
+        case Gem_Yellow:
+        {
+            // Prevent Yellow Gem spam.
+            if (pSonicContext->m_IsThunderGuard)
+                break;
+        }
+
+        case Gem_Blue:
+        case Gem_Green:
+        case Gem_Sky:
+        case Gem_White:
+        case Gem_Super:
+        {
+            auto spriteIndex = Sonicteam::Player::State::SonicContext::ms_GemSpriteConversionTable[gemIndex - 1] - 1;
+
+            if (pSonicGauge->m_Value >= (&pSonicGauge->c_gauge_green)[spriteIndex].get())
+            {
+                ctx.r3.u64 = 1;
+                return;
+            }
+
+            break;
+        }
+
+        case Gem_Red:
+        case Gem_Purple:
+        {
+            if (pSonicContext->m_Field24A == 0)
+            {
+                ctx.r3.u64 = 1;
+                return;
+            }
+
+            break;
+        }
+    }
+
+    ctx.r3.u64 = 0;
+}
+
+PPC_FUNC_IMPL(__imp__sub_82218068);
+PPC_FUNC(sub_82218068)
+{
+    if (!Config::RestoreSonicActionGauge)
+    {
+        __imp__sub_82217FC0(ctx, base);
+        return;
+    }
+
+    auto pSonicContext = (Sonicteam::Player::State::SonicContext*)(base + ctx.r3.u32);
+    auto pSonicGauge = pSonicContext->m_spGauge.get();
+    auto deltaTime = ctx.f1.f64;
+
+    using enum Sonicteam::Player::State::SonicContext::Gem;
+
+    auto gemIndex = (Sonicteam::Player::State::SonicContext::Gem)ctx.r4.u32;
+    auto spriteIndex = Sonicteam::Player::State::SonicContext::ms_GemSpriteConversionTable[gemIndex - 1] - 1;
+
+    switch (gemIndex)
+    {
+        case Gem_Blue:
+        case Gem_Green:
+        case Gem_Yellow:
+        case Gem_Sky:
+        case Gem_White:
+        case Gem_Super:
+        {
+            pSonicGauge->m_Value = pSonicGauge->m_Value.get() - (&pSonicGauge->c_gauge_green)[spriteIndex].get();
+            pSonicGauge->m_GroundedTime = 0.0;
+            break;
+        }
+
+        case Gem_Red:
+        case Gem_Purple:
+        {
+            pSonicGauge->m_Value = pSonicGauge->m_Value.get() - (&pSonicGauge->c_gauge_green)[spriteIndex].get() * deltaTime;
+            pSonicGauge->m_GroundedTime = 0.0;
+
+            if (pSonicGauge->m_Value <= 0)
+            {
+                pSonicGauge->m_Value = 0.0;
+                pSonicContext->m_IsPurpleGem = 0;
+                pSonicContext->m_IsRedGem = 0;
+                pSonicContext->m_Field24A = 1;
+            }
+
+            break;
+        }
+    }
+}
+
+// Sonicteam::Player::SonicGauge::IVariable::Init
+// This hook redirects the incorrectly named Lua variables to the ones actually used in the scripts.
+PPC_FUNC_IMPL(__imp__sub_8223F360);
+PPC_FUNC(sub_8223F360)
+{
+    auto pIVariable = ctx.r3.u32;
+    auto pLuaSystem = ctx.r4.u32;
+
+    __imp__sub_8223F360(ctx, base);
+
+    if (!Config::RestoreSonicActionGauge)
+        return;
+
+    auto pSonicGauge = (Sonicteam::Player::SonicGauge*)g_memory.Translate(pIVariable - 0x20);
+    auto pVariableName = g_userHeap.Alloc<stdx::string>();
+
+    *pVariableName = "c_gauge_green";
+
+    if (pSonicGauge->c_gauge_green == 0.0f)
+        pSonicGauge->c_gauge_green = GuestToHostFunction<float>(sub_821EA350, pLuaSystem, pVariableName);
+
+    *pVariableName = "c_gauge_red";
+
+    if (pSonicGauge->c_gauge_red == 0.0f)
+        pSonicGauge->c_gauge_red = GuestToHostFunction<float>(sub_821EA350, pLuaSystem, pVariableName);
+
+    *pVariableName = "c_gauge_blue";
+
+    if (pSonicGauge->c_gauge_blue == 0.0f)
+        pSonicGauge->c_gauge_blue = GuestToHostFunction<float>(sub_821EA350, pLuaSystem, pVariableName);
+
+    *pVariableName = "c_gauge_white";
+
+    if (pSonicGauge->c_gauge_white == 0.0f)
+        pSonicGauge->c_gauge_white = GuestToHostFunction<float>(sub_821EA350, pLuaSystem, pVariableName);
+
+    *pVariableName = "c_gauge_sky";
+
+    if (pSonicGauge->c_gauge_sky == 0.0f)
+        pSonicGauge->c_gauge_sky = GuestToHostFunction<float>(sub_821EA350, pLuaSystem, pVariableName);
+
+    *pVariableName = "c_gauge_yellow";
+
+    if (pSonicGauge->c_gauge_yellow == 0.0f)
+        pSonicGauge->c_gauge_yellow = GuestToHostFunction<float>(sub_821EA350, pLuaSystem, pVariableName);
+
+    *pVariableName = "c_gauge_purple";
+
+    if (pSonicGauge->c_gauge_purple == 0.0f)
+        pSonicGauge->c_gauge_purple = GuestToHostFunction<float>(sub_821EA350, pLuaSystem, pVariableName);
+
+    *pVariableName = "c_gauge_super";
+
+    if (pSonicGauge->c_gauge_super == 0.0f)
+        pSonicGauge->c_gauge_super = GuestToHostFunction<float>(sub_821EA350, pLuaSystem, pVariableName);
+
+    pVariableName->~basic_string();
+
+    g_userHeap.Free(pVariableName);
+}
+ 
+void SonicGauge_FixGemSprite(PPCRegister& r)
+{
+    auto pGame = (Sonicteam::GameImp*)g_memory.Translate(r.u32);
+
+    for (int i = 0; i < 4; i++)
+        pGame->m_PlayerData[i].GemIndex = 0;
+}
+
+void SonicGauge_FixFlags(PPCRegister& r3, PPCRegister& r31)
+{
+    if (!Config::RestoreSonicActionGauge || !r3.u32)
+        return;
+
+    auto pSonicGauge = (Sonicteam::Player::SonicGauge*)g_memory.Translate(r3.u32);
+
+    // Ensure this is SonicGauge.
+    if (((Sonicteam::Player::IPlugIn*)pSonicGauge)->m_pVftable.ptr != 0x8200D4D8)
+        return;
+
+    auto pSonicContext = (Sonicteam::Player::State::SonicContext*)g_memory.Translate(r31.u32);
+    auto pSonicWeapons = pSonicContext->m_spScore->m_pPlayer->GetPlugIn<Sonicteam::Player::Weapon::SonicWeapons>("sonic_weapons");
+
+    static constexpr uint8_t s_groundedAnims[4] = { 0xCB, 0xCC, 0x46, 0xCE };
+
+    for (auto i = 0; i < 4; i++)
+    {
+        if (pSonicContext->m_AnimationID == s_groundedAnims[i])
+            pSonicGauge->m_GroundedFlags = 1;
+    }
+
+    if (pSonicContext->m_IsTornado != 0 || pSonicWeapons->m_rGunDrive.m_pRef)
+    {
+        pSonicGauge->m_GroundedFlags = 1;
+    }
+    else
+    {
+        using enum Sonicteam::Player::State::SonicContext::Gem;
+
+        if ((pSonicContext->m_Buttons.get() & 0x10000) != 0)
+            pSonicContext->m_Field24A = 0;
+
+        if ((pSonicContext->m_Buttons.get() & 0x20000) != 0 && (pSonicContext->m_CurrentGem == Gem_Red || pSonicContext->m_CurrentGem == Gem_Purple))
+        {
+            pSonicGauge->m_GroundedFlags = 1;
+
+            if (pSonicContext->m_Field24A)
+            {
+                pSonicGauge->m_GroundedFlags = 0;
+                pSonicContext->m_IsPurpleGem = 0;
+                pSonicContext->m_IsRedGem = 0;
+            }
+        }
+        else if ((pSonicContext->m_PostureFlags.get() & Sonicteam::Player::PostureControlFlags_Grounded) != 0 || pSonicContext->m_Field24A)
+        {
+            pSonicGauge->m_GroundedFlags = 0;
+        }
+    }
+}
+
+bool DisableLives()
+{
+    return Config::DisableLives;
+}
+
+bool AlwaysHoldPhysicsObjects()
+{
+    return Config::AlwaysHoldPhysicsObjects;
+}
+
+bool ControllableHomingRecovery()
+{
+    return Config::ControllableHomingRecovery;
+}
+
+bool RestoreHomingSpam()
+{
+    return Config::RestoreHomingSpam;
+}

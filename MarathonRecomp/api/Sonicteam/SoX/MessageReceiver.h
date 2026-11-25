@@ -1,0 +1,39 @@
+#pragma once
+
+#include <Marathon.inl>
+#include <Sonicteam/SoX/Message.h>
+
+namespace Sonicteam::SoX
+{
+    class MessageReceiver
+    {
+    public:
+        struct Vftable
+        {
+            be<uint32_t> fpDtor;
+            be<uint32_t> fpProcessMessage;
+        };
+
+        xpointer<Vftable> m_pVftable;
+
+        void* Destroy(uint8_t flags = 1)
+        {
+            return GuestToHostFunction<void*>(m_pVftable->fpDtor, this, flags);
+        }
+
+        bool ProcessMessage(IMessage* pMessage)
+        {
+            return GuestToHostFunction<bool>(m_pVftable->fpProcessMessage, this, pMessage);
+        }
+
+        template <typename T, typename... TArgs>
+        bool ProcessMessage(TArgs&&... in_args)
+        {
+            guest_stack_var<T> msg(std::forward<TArgs>(in_args)...);
+            return ProcessMessage(msg);
+        }
+    };
+
+    MARATHON_ASSERT_OFFSETOF(MessageReceiver, m_pVftable, 0x00);
+    MARATHON_ASSERT_SIZEOF(MessageReceiver, 4);
+}

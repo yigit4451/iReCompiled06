@@ -1,0 +1,37 @@
+#pragma once
+
+#include <api/Marathon.h>
+#include <user/config.h>
+
+enum class IntegrityCheckType {
+    UserRequest,
+    GameDataError,
+    DlcDataError
+};
+
+class App
+{
+public:
+    static inline bool s_isInit;
+    static inline bool s_isSkipLogos;
+    static inline bool s_isLoading;
+    static inline bool s_isSaving;
+    static inline bool s_isSaveDataCorrupt;
+    static inline bool s_isPaused;
+    static inline bool s_isDrawUI = true;
+
+    static inline Sonicteam::AppMarathon* s_pApp;
+
+    static inline EPlayerCharacter s_playerCharacter;
+    static inline ELanguage s_language;
+
+    static inline double s_deltaTime;
+    static inline double s_time = 0.0; // How much time elapsed since the game started.
+
+    static void RefreshMainThreadId();
+    static void Update(double in_deltaTime);
+    static void Restart(std::vector<std::string> restartArgs = {});
+    static void Exit();
+    static void CheckIntegrity(IntegrityCheckType type);
+};
+

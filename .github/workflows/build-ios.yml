@@ -1,0 +1,223 @@
+name: Build iOS (iReCompiled06 Unsigned IPA)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    name: Build iReCompiled06 (arm64 Release IPA)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository (Recursive Submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Populate Private Xbox 360 Assets (Optional)
+        env:
+          ASSET_REPO: ${{ secrets.ASSET_REPO }}
+          ASSET_REPO_TOKEN: ${{ secrets.ASSET_REPO_TOKEN }}
+        run: |
+          if [ -n "${ASSET_REPO}" ] && [ -n "${ASSET_REPO_TOKEN}" ]; then
+            echo "Cloning private asset repository ${ASSET_REPO}..."
+            git clone --depth=1 "https://x-access-token:${ASSET_REPO_TOKEN}@github.com/${ASSET_REPO}.git" ./private_assets
+            mkdir -p ./MarathonRecompLib/private
+            cp -R ./private_assets/* ./MarathonRecompLib/private/
+            rm -rf ./private_assets
+          else
+            echo "No ASSET_REPO secret configured; CMake will use tools/generate_stub_recomp.py fallback."
+          fi
+
+      - name: Install Build Tools & Verify Xcode Metal Toolchain
+        run: |
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          command -v cmake >/dev/null 2>&1 || brew install cmake
+          command -v ninja >/dev/null 2>&1 || brew install ninja
+          command -v pkg-config >/dev/null 2>&1 || brew install pkg-config
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun -sdk iphoneos metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+
+      - name: Cache MoltenVK iOS XCFramework
+        id: cache-moltenvk
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/MoltenVK-ios
+          key: moltenvk-ios-v1.4.2
+
+      - name: Setup MoltenVK for iOS (arm64)
+        run: |
+          MOLTENVK_ROOT="${RUNNER_TEMP}/MoltenVK-ios"
+          if [ "${{ steps.cache-moltenvk.outputs.cache-hit }}" != "true" ]; then
+            mkdir -p "${MOLTENVK_ROOT}"
+            curl -fL --retry 3 "https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar" -o "${RUNNER_TEMP}/MoltenVK-ios.tar"
+            tar -xf "${RUNNER_TEMP}/MoltenVK-ios.tar" -C "${MOLTENVK_ROOT}"
+            rm -f "${RUNNER_TEMP}/MoltenVK-ios.tar"
+          fi
+
+          MOLTENVK_DYNAMIC_FW="$(find "${MOLTENVK_ROOT}" -type d -path "*ios-arm64*" -name "MoltenVK.framework" | grep -v -i simulator | head -n 1 || true)"
+          MOLTENVK_STATIC_LIB="$(find "${MOLTENVK_ROOT}" -type f -path "*ios-arm64*" -name "libMoltenVK.a" | grep -v -i simulator | head -n 1 || true)"
+
+          if [ -n "${MOLTENVK_DYNAMIC_FW}" ]; then
+            echo "MOLTENVK_DYNAMIC_FW=${MOLTENVK_DYNAMIC_FW}" >> "$GITHUB_ENV"
+            echo "MOLTENVK_LINK_TARGET=${MOLTENVK_DYNAMIC_FW}" >> "$GITHUB_ENV"
+          elif [ -n "${MOLTENVK_STATIC_LIB}" ]; then
+            echo "MOLTENVK_LINK_TARGET=${MOLTENVK_STATIC_LIB}" >> "$GITHUB_ENV"
+          else
+            echo "::error::Failed to locate iOS arm64 MoltenVK artifact in MoltenVK-ios.tar"
+            exit 1
+          fi
+
+      - name: Cache Minimal iOS arm64 FFmpeg (XMA Decoder)
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ffmpeg-ios-arm64
+          key: ffmpeg-ios-arm64-7.1.1-xma-v1
+
+      - name: Build Minimal iOS arm64 FFmpeg (XMA1/XMA2/XMAFrames)
+        run: |
+          FFMPEG_PREFIX="${RUNNER_TEMP}/ffmpeg-ios-arm64"
+          if [ ! -f "${FFMPEG_PREFIX}/lib/libavcodec.a" ]; then
+            IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+            CC_IOS="$(xcrun --sdk iphoneos -f clang)"
+            CXX_IOS="$(xcrun --sdk iphoneos -f clang++)"
+            AR_IOS="$(xcrun --sdk iphoneos -f ar)"
+            RANLIB_IOS="$(xcrun --sdk iphoneos -f ranlib)"
+            STRIP_IOS="$(xcrun --sdk iphoneos -f strip)"
+
+            mkdir -p "${RUNNER_TEMP}/ffmpeg-src"
+            curl -fL --retry 3 "https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz" -o "${RUNNER_TEMP}/ffmpeg.tar.xz"
+            tar -xf "${RUNNER_TEMP}/ffmpeg.tar.xz" -C "${RUNNER_TEMP}/ffmpeg-src" --strip-components=1
+
+            pushd "${RUNNER_TEMP}/ffmpeg-src"
+            ./configure \
+              --prefix="${FFMPEG_PREFIX}" \
+              --enable-cross-compile \
+              --arch=arm64 \
+              --target-os=darwin \
+              --cc="${CC_IOS}" \
+              --cxx="${CXX_IOS}" \
+              --ar="${AR_IOS}" \
+              --ranlib="${RANLIB_IOS}" \
+              --strip="${STRIP_IOS}" \
+              --sysroot="${IOS_SDK}" \
+              --extra-cflags="-arch arm64 -miphoneos-version-min=17.0 -O3" \
+              --extra-ldflags="-arch arm64 -miphoneos-version-min=17.0" \
+              --disable-everything \
+              --disable-programs \
+              --disable-doc \
+              --disable-network \
+              --disable-autodetect \
+              --disable-asm \
+              --enable-static \
+              --disable-shared \
+              --enable-avcodec \
+              --enable-avutil \
+              --enable-avformat \
+              --enable-swresample \
+              --enable-swscale \
+              --enable-avfilter \
+              --enable-decoder=xma1,xma2,xmaframes,wmav1,wmav2,wmapro
+            make -j"$(sysctl -n hw.logicalcpu)"
+            make install
+            popd
+            rm -rf "${RUNNER_TEMP}/ffmpeg-src" "${RUNNER_TEMP}/ffmpeg.tar.xz"
+          fi
+          echo "FFMPEG_IOS_PREFIX=${FFMPEG_PREFIX}" >> "$GITHUB_ENV"
+
+      - name: Bootstrap vcpkg & Cache Binary Archives
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-ios-arm64-${{ hashFiles('vcpkg.json') }}
+
+      - name: Initialize vcpkg
+        working-directory: ./thirdparty/vcpkg
+        run: ./bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Build Native macOS Host Code-Generation Tools
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/thirdparty/vcpkg
+        run: |
+          cmake . --preset ios-host-tools
+          cmake --build ./out/build/ios-host-tools --config Release --target file_to_c XenonRecomp u8extract XenosRecomp
+
+      - name: Configure Xcode Project for iOS arm64 (iReCompiled06)
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/thirdparty/vcpkg
+        run: |
+          cmake -S . -B ./out/build/ios-xcode \
+            -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DMARATHON_BUILD_IOS_APP=ON \
+            -DCMAKE_TOOLCHAIN_FILE="${GITHUB_WORKSPACE}/thirdparty/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=arm64-ios \
+            -DMARATHON_HOST_TOOLS_DIR="${GITHUB_WORKSPACE}/out/build/ios-host-tools" \
+            -DMARATHON_IOS_FFMPEG_ROOT="${FFMPEG_IOS_PREFIX}" \
+            -DMARATHON_IOS_MOLTENVK="${MOLTENVK_LINK_TARGET}" \
+            -DMARATHON_IOS_MOLTENVK_FRAMEWORK="${MOLTENVK_DYNAMIC_FW:-}"
+
+      - name: Build Unsigned iReCompiled06.app (arm64 Release)
+        run: |
+          xcodebuild \
+            -project ./out/build/ios-xcode/MarathonRecomp-ALL.xcodeproj \
+            -target iReCompiled06 \
+            -configuration Release \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO
+
+      - name: Package Unsigned iReCompiled06.ipa
+        run: |
+          APP_BUNDLE="$(find ./out/build/ios-xcode -type d -name "iReCompiled06.app" | grep -i "Release-iphoneos" | head -n 1)"
+          if [ -z "${APP_BUNDLE}" ]; then
+            APP_BUNDLE="$(find ./out/build/ios-xcode -type d -name "iReCompiled06.app" | head -n 1)"
+          fi
+
+          if [ -z "${APP_BUNDLE}" ] || [ ! -d "${APP_BUNDLE}" ]; then
+            echo "::error::Could not find built iReCompiled06.app bundle!"
+            exit 1
+          fi
+
+          echo "Packaging app bundle from: ${APP_BUNDLE}"
+          rm -rf Payload iReCompiled06.ipa
+          mkdir -p Payload
+          cp -R "${APP_BUNDLE}" Payload/iReCompiled06.app
+
+          if [ -n "${MOLTENVK_DYNAMIC_FW:-}" ] && [ -d "${MOLTENVK_DYNAMIC_FW}" ]; then
+            mkdir -p Payload/iReCompiled06.app/Frameworks
+            if [ ! -d "Payload/iReCompiled06.app/Frameworks/MoltenVK.framework" ]; then
+              cp -R "${MOLTENVK_DYNAMIC_FW}" Payload/iReCompiled06.app/Frameworks/MoltenVK.framework
+            fi
+          fi
+
+          ditto -c -k --sequesterRsrc --keepParent Payload iReCompiled06.ipa
+          ls -lh iReCompiled06.ipa
+
+      - name: Upload Unsigned IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iReCompiled06.ipa
+          path: iReCompiled06.ipa
+          if-no-files-found: error

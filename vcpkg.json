@@ -1,0 +1,23 @@
+{
+    "builtin-baseline": "9e593bb18ea69cc5095e012465dcd675a822ed0d",
+    "dependencies": [
+        {
+            "name": "directx-headers",
+            "platform": "windows"
+        },
+        {
+            "name": "directx12-agility",
+            "platform": "windows"
+        },
+        "freetype",
+        {
+            "name": "curl",
+            "platform": "!ios"
+        }
+    ],
+    "vcpkg-configuration": {
+        "overlay-triplets": [
+            "vcpkg/triplets"
+        ]
+    }
+}
