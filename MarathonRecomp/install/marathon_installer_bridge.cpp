@@ -178,11 +178,85 @@ extern "C" MARATHON_CORE_API bool IsMarathonInstalled(void)
 {
     try
     {
+        const std::filesystem::path installRoot = GetInstallRoot();
         std::filesystem::path modulePath;
-        return Installer::checkGameInstall(GetInstallRoot(), modulePath);
+        if (Installer::checkGameInstall(installRoot, modulePath))
+            return true;
+
+        std::error_code ec;
+        if (std::filesystem::exists(installRoot / "default.xex", ec) &&
+            std::filesystem::exists(installRoot / "xenon", ec))
+        {
+            return true;
+        }
+        return false;
     }
     catch (...)
     {
+        return false;
+    }
+}
+
+extern "C" MARATHON_CORE_API bool VerifyMarathonInstallIntegrity(
+    char* detailBuffer,
+    int detailBufferSize)
+{
+    WriteStringToBuffer("", detailBuffer, detailBufferSize);
+
+    try
+    {
+#ifdef MARATHON_RECOMP_IOS
+        os::ios::EnsureSandboxDirectories();
+#endif
+        const std::filesystem::path installRoot = GetInstallRoot();
+        std::error_code ec;
+
+        const std::filesystem::path decryptedBin = installRoot / "decrypted" / "default.bin";
+        const std::filesystem::path gameXex = installRoot / "game" / "default.xex";
+        const std::filesystem::path rootXex = installRoot / "default.xex";
+
+        if (std::filesystem::exists(decryptedBin, ec) && std::filesystem::file_size(decryptedBin, ec) > sizeof(DecryptedExecutableHeader))
+        {
+            WriteStringToBuffer("Mevcut kurulum doğrulandı (decrypted/default.bin hazır).", detailBuffer, detailBufferSize);
+            return true;
+        }
+
+        std::filesystem::path candidateXex;
+        if (std::filesystem::exists(gameXex, ec))
+        {
+            candidateXex = gameXex;
+        }
+        else if (std::filesystem::exists(rootXex, ec))
+        {
+            candidateXex = rootXex;
+            if (std::filesystem::exists(installRoot / "xenon", ec) && !std::filesystem::exists(installRoot / "game" / "xenon", ec))
+            {
+                std::filesystem::create_directories(installRoot / "game", ec);
+                std::filesystem::rename(installRoot / "xenon", installRoot / "game" / "xenon", ec);
+            }
+        }
+
+        if (!candidateXex.empty())
+        {
+            std::string xexError;
+            if (ExtractStandaloneXex(candidateXex, installRoot, nullptr, nullptr, xexError))
+            {
+                WriteStringToBuffer("Manuel kopyalanan default.xex doğrulandı ve decrypted/default.bin hazırlandı.", detailBuffer, detailBufferSize);
+                return true;
+            }
+            WriteStringToBuffer(xexError.empty() ? "default.xex doğrulanamadı." : xexError, detailBuffer, detailBufferSize);
+            return false;
+        }
+
+        WriteStringToBuffer(
+            "Documents/iReCompiled06 dizininde kurulu oyun (decrypted/default.bin veya game/default.xex) bulunamadı. Lütfen dosyaları kopyaladığınızdan emin olun veya kurulum sihirbazını kullanın.",
+            detailBuffer,
+            detailBufferSize);
+        return false;
+    }
+    catch (const std::exception& e)
+    {
+        WriteStringToBuffer(e.what(), detailBuffer, detailBufferSize);
         return false;
     }
 }

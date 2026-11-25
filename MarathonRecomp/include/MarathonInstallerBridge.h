@@ -73,6 +73,15 @@ MARATHON_CORE_API bool StartMarathonExtraction(
 );
 
 /**
+ * Verifies that an existing or manually copied game installation under <Sandbox>/Documents/iReCompiled06/
+ * is ready to launch (ensuring decrypted/default.bin or game/default.xex is present and valid).
+ */
+MARATHON_CORE_API bool VerifyMarathonInstallIntegrity(
+    char* detailBuffer,
+    int detailBufferSize
+);
+
+/**
  * Signals an in-flight StartMarathonExtraction() call to cancel cleanly and roll back partial files.
  */
 MARATHON_CORE_API void CancelMarathonExtraction(void);
