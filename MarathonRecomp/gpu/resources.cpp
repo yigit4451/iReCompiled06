@@ -4,17 +4,24 @@
 #include "video_internal.h"
 #include "guest_convert.h"
 
+#include <algorithm>
+#include <bit>
 #include <kernel/function.h>
 #include <kernel/heap.h>
 #include <kernel/memory.h>
 #include <user/config.h>
 #include <utils/host_thread.h>
 
+#ifdef MARATHON_RECOMP_IOS
+#include <os/ios/memory_ios.h>
+#endif
+
 std::atomic<uint32_t> g_bufferUploadCount = 0;
 
 uint32_t ComputeTexturePitch(GuestTexture* texture)
 {
-    return (texture->width * RenderFormatSize(texture->format) + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
+    const uint32_t safeW = std::max(1u, texture->width);
+    return (safeW * RenderFormatSize(texture->format) + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
 }
 
 GuestTexture* CreateTexture(uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, uint32_t usage, uint32_t format, uint32_t pool, uint32_t type)
@@ -34,18 +41,32 @@ GuestTexture* CreateTexture(uint32_t width, uint32_t height, uint32_t depth, uin
         break;
     }
 
+    const uint32_t safeWidth = std::max(1u, width);
+    const uint32_t safeHeight = std::max(1u, height);
+    const uint32_t safeDepth = std::max(1u, depth);
+    const uint32_t maxValidMips = static_cast<uint32_t>(std::bit_width(std::max({ 1u, safeWidth, safeHeight, resourceType == ResourceType::VolumeTexture ? safeDepth : 1u })));
+    const uint32_t safeLevels = std::clamp(levels == 0 ? 1u : levels, 1u, maxValidMips);
+
+    RenderFormat hostFormat = ConvertFormat(format);
+#ifdef MARATHON_RECOMP_IOS
+    if ((hostFormat == RenderFormat::BC1_UNORM || hostFormat == RenderFormat::BC3_UNORM) && !os::ios::SupportsNativeBCTextures())
+    {
+        hostFormat = RenderFormat::R8G8B8A8_UNORM;
+    }
+#endif
+
     RenderTextureDesc desc;
     desc.dimension = resourceType == ResourceType::VolumeTexture ? RenderTextureDimension::TEXTURE_3D : RenderTextureDimension::TEXTURE_2D;
-    desc.width = width;
-    desc.height = height;
-    desc.mipLevels = levels;
-    desc.format = ConvertFormat(format);
+    desc.width = safeWidth;
+    desc.height = safeHeight;
+    desc.mipLevels = safeLevels;
+    desc.format = hostFormat;
 
     if (resourceType == ResourceType::ArrayTexture) {
-        desc.arraySize = depth;
+        desc.arraySize = safeDepth;
         desc.depth = 1;
     } else {
-        desc.depth = depth;
+        desc.depth = safeDepth;
         desc.arraySize = 1;
     }
 
@@ -59,7 +80,7 @@ GuestTexture* CreateTexture(uint32_t width, uint32_t height, uint32_t depth, uin
     RenderTextureViewDesc viewDesc;
     viewDesc.format = desc.format;
     viewDesc.dimension = resourceType == ResourceType::VolumeTexture ? RenderTextureViewDimension::TEXTURE_3D : RenderTextureViewDimension::TEXTURE_2D;
-    viewDesc.mipLevels = levels;
+    viewDesc.mipLevels = safeLevels;
 
     switch (format)
     {
@@ -82,13 +103,14 @@ GuestTexture* CreateTexture(uint32_t width, uint32_t height, uint32_t depth, uin
     texture->texture = texture->textureHolder.get();
     texture->textureView = texture->texture->createTextureView(viewDesc);
 
-    texture->width = width;
-    texture->height = height;
-    texture->depth = depth;
+    texture->width = safeWidth;
+    texture->height = safeHeight;
+    texture->depth = safeDepth;
     texture->format = desc.format;
+    texture->guestFormat = format;
     texture->mipLevels = viewDesc.mipLevels;
     texture->viewDimension = viewDesc.dimension;
-    texture->allocatedBytes = static_cast<uint64_t>(ComputeTexturePitch(texture)) * std::max(1u, height) * std::max(1u, depth);
+    texture->allocatedBytes = static_cast<uint64_t>(ComputeTexturePitch(texture)) * safeHeight * safeDepth;
     g_liveTextureBytes.fetch_add(texture->allocatedBytes, std::memory_order_relaxed);
     texture->descriptorIndex = g_textureDescriptorAllocator.allocate();
 
@@ -109,6 +131,8 @@ GuestTexture* CreateTexture(uint32_t width, uint32_t height, uint32_t depth, uin
 
 GuestSurface* CreateSurface(uint32_t width, uint32_t height, uint32_t format, uint32_t multiSample, const GuestSurfaceCreateParams* params)
 {
+    const uint32_t safeWidth = std::max(1u, width);
+    const uint32_t safeHeight = std::max(1u, height);
     const RenderFormat renderFormat = ConvertFormat(format);
     const RenderSampleCounts sampleCount = multiSample != 0 ? GetRenderSampleCount() : RenderSampleCount::COUNT_1;
     const bool isDepthStencil = RenderFormatIsDepth(renderFormat);
@@ -116,8 +140,8 @@ GuestSurface* CreateSurface(uint32_t width, uint32_t height, uint32_t format, ui
     const auto surface = g_userHeap.AllocPhysical<GuestSurface>();
 
     surface->type = isDepthStencil ? ResourceType::DepthStencil : ResourceType::RenderTarget;
-    surface->width = width;
-    surface->height = height;
+    surface->width = safeWidth;
+    surface->height = safeHeight;
     surface->format = renderFormat;
     surface->guestFormat = format;
     surface->multiSampleType = multiSample;
@@ -128,14 +152,14 @@ GuestSurface* CreateSurface(uint32_t width, uint32_t height, uint32_t format, ui
     if (params != nullptr)
     {
         // The view shares the variant's host resources without owning them.
-        surface->variant = AcquireSurfaceVariant(params->base, width, height, format, sampleCount, created);
+        surface->variant = AcquireSurfaceVariant(params->base, safeWidth, safeHeight, format, sampleCount, created);
         surface->texture = surface->variant->textureHolder.get();
         surface->descriptorIndex = surface->variant->descriptorIndex;
     }
     else
     {
         // No EDRAM placement information: the surface owns its host texture.
-        const auto desc = MakeSurfaceTextureDesc(width, height, renderFormat, sampleCount);
+        const auto desc = MakeSurfaceTextureDesc(safeWidth, safeHeight, renderFormat, sampleCount);
         surface->textureHolder = Video::GetRenderDevice()->createTexture(desc);
         surface->texture = surface->textureHolder.get();
 
@@ -178,8 +202,23 @@ void ReleaseResource(GuestResource* resource)
 
 static void LockTextureRect(GuestTexture* texture, uint32_t, GuestLockedRect* lockedRect)
 {
-    uint32_t pitch = ComputeTexturePitch(texture);
-    uint32_t slicePitch = pitch * texture->height;
+    uint32_t pitch = 0;
+    uint32_t slicePitch = 0;
+
+    if ((texture->guestFormat == D3DFMT_DXT1 || texture->guestFormat == D3DFMT_DXT4) &&
+        texture->format == RenderFormat::R8G8B8A8_UNORM)
+    {
+        const uint32_t blocksX = (std::max(1u, texture->width) + 3u) / 4u;
+        const uint32_t blocksY = (std::max(1u, texture->height) + 3u) / 4u;
+        const uint32_t blockBytes = (texture->guestFormat == D3DFMT_DXT1) ? 8u : 16u;
+        pitch = (blocksX * blockBytes + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
+        slicePitch = pitch * blocksY;
+    }
+    else
+    {
+        pitch = ComputeTexturePitch(texture);
+        slicePitch = pitch * std::max(1u, texture->height);
+    }
 
     if (texture->mappedMemory == nullptr)
         texture->mappedMemory = g_userHeap.AllocPhysical(slicePitch, 0x10);

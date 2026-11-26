@@ -54,12 +54,19 @@ add_subdirectory("${MARATHON_RECOMP_THIRDPARTY_ROOT}/SDL_mixer")
 add_subdirectory("${MARATHON_RECOMP_THIRDPARTY_ROOT}/plume")
 
 if (CMAKE_SYSTEM_NAME STREQUAL "iOS" AND TARGET plume)
-    # Replace macOS AppKit/IOKit plume_apple.mm with iOS UIKit implementation while keeping thirdparty/plume submodule clean.
+    # Replace macOS AppKit/IOKit plume_apple.mm and unvalidated plume_metal.cpp with iOS-validated implementations while keeping thirdparty/plume submodule clean.
     get_target_property(_PLUME_SOURCES plume SOURCES)
     if (_PLUME_SOURCES)
         list(FILTER _PLUME_SOURCES EXCLUDE REGEX "plume_apple\\.mm$")
-        list(APPEND _PLUME_SOURCES "${CMAKE_SOURCE_DIR}/MarathonRecomp/os/ios/plume_ios.mm")
-        set_target_properties(plume PROPERTIES SOURCES "${_PLUME_SOURCES}")
+        list(FILTER _PLUME_SOURCES EXCLUDE REGEX "plume_metal\\.cpp$")
+        list(APPEND _PLUME_SOURCES
+            "${CMAKE_SOURCE_DIR}/MarathonRecomp/os/ios/plume_ios.mm"
+            "${CMAKE_SOURCE_DIR}/MarathonRecomp/os/ios/plume_metal_ios.cpp"
+        )
+        set_target_properties(plume PROPERTIES
+            SOURCES "${_PLUME_SOURCES}"
+            CXX_STANDARD 20
+        )
     endif()
     target_include_directories(plume PRIVATE "${MARATHON_RECOMP_THIRDPARTY_ROOT}/plume")
 endif()

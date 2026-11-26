@@ -2,6 +2,7 @@
 #include <os/logger.h>
 
 #import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
 #import <UIKit/UIKit.h>
 #include <atomic>
 #include <cstdlib>
@@ -162,4 +163,31 @@ void os::ios::InstallMemoryWarningObserver()
 bool os::ios::ConsumeMemoryWarningFlag()
 {
     return g_memoryWarningPending.exchange(false, std::memory_order_acq_rel);
+}
+
+bool os::ios::SupportsNativeBCTextures()
+{
+    static const bool s_supportsBC = []() -> bool
+    {
+        @autoreleasepool
+        {
+            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+            if (!device)
+                return false;
+
+            bool supported = false;
+            if (@available(iOS 16.4, *))
+            {
+                if ([device respondsToSelector:@selector(supportsBCTextureCompression)])
+                {
+                    supported = [device supportsBCTextureCompression];
+                }
+            }
+#if !__has_feature(objc_arc)
+            [device release];
+#endif
+            return supported;
+        }
+    }();
+    return s_supportsBC;
 }

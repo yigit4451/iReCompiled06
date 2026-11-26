@@ -45,4 +45,8 @@ namespace os::ios
 
     // Atomically consumes and clears any pending iOS memory warning signal.
     bool ConsumeMemoryWarningFlag();
+
+    // Returns true if the active iOS GPU natively supports desktop BC1-BC7 compressed textures
+    // (requires Apple GPU Family 9 / A17 Pro / M-series on iOS 16.4+; false on A13/A14/A15/A16).
+    bool SupportsNativeBCTextures();
 }

@@ -237,6 +237,7 @@ struct GuestTexture : GuestBaseTexture
 {
     uint32_t depth = 0;
     uint32_t mipLevels = 1;
+    uint32_t guestFormat = 0;
     RenderTextureViewDimension viewDimension = RenderTextureViewDimension::UNKNOWN;
     void* mappedMemory = nullptr;
     ankerl::unordered_dense::map<uint32_t, std::unique_ptr<RenderFramebuffer>> framebuffers;
@@ -534,5 +535,6 @@ enum GuestTextureAddress
 };
 
 extern std::unique_ptr<GuestTexture> LoadTexture(const uint8_t* data, size_t dataSize, RenderComponentMapping componentMapping = RenderComponentMapping());
+extern bool DecompressBCSliceToLinear(RenderFormat bcFormat, const uint8_t* srcBlocks, uint32_t srcRowPitch, uint32_t width, uint32_t height, uint8_t* dstLinear, uint32_t dstRowPitch);
 
 extern void VideoConfigValueChangedCallback(const class IConfigDef* config);

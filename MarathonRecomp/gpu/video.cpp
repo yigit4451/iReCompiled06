@@ -1756,15 +1756,37 @@ static void ProcRenderCommand(const RenderCommands::UnlockTextureRect& args)
     AddBarrier(args.texture, RenderTextureLayout::COPY_DEST);
     FlushBarriers();
 
-    uint32_t pitch = ComputeTexturePitch(args.texture);
-    uint32_t slicePitch = pitch * args.texture->height;
+    const uint32_t safeW = std::max(1u, args.texture->width);
+    const uint32_t safeH = std::max(1u, args.texture->height);
+    const uint32_t dstPitch = ComputeTexturePitch(args.texture);
+    const uint32_t dstSlicePitch = dstPitch * safeH;
 
-    auto allocation = g_uploadAllocators[g_frame].allocate(slicePitch, PLACEMENT_ALIGNMENT);
-    memcpy(allocation.memory, args.texture->mappedMemory, slicePitch);
+    auto allocation = g_uploadAllocators[g_frame].allocate(dstSlicePitch, PLACEMENT_ALIGNMENT);
+
+    if ((args.texture->guestFormat == D3DFMT_DXT1 || args.texture->guestFormat == D3DFMT_DXT4) &&
+        args.texture->format == RenderFormat::R8G8B8A8_UNORM)
+    {
+        const uint32_t blocksX = (safeW + 3u) / 4u;
+        const uint32_t blockBytes = (args.texture->guestFormat == D3DFMT_DXT1) ? 8u : 16u;
+        const uint32_t srcPitch = (blocksX * blockBytes + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
+        const RenderFormat bcFmt = (args.texture->guestFormat == D3DFMT_DXT1) ? RenderFormat::BC1_UNORM : RenderFormat::BC3_UNORM;
+        DecompressBCSliceToLinear(
+            bcFmt,
+            static_cast<const uint8_t*>(args.texture->mappedMemory),
+            srcPitch,
+            safeW,
+            safeH,
+            static_cast<uint8_t*>(allocation.memory),
+            dstPitch);
+    }
+    else
+    {
+        memcpy(allocation.memory, args.texture->mappedMemory, dstSlicePitch);
+    }
 
     g_commandLists[g_frame]->copyTextureRegion(
         RenderTextureCopyLocation::Subresource(args.texture->texture, 0),
-        RenderTextureCopyLocation::PlacedFootprint(allocation.buffer, args.texture->format, args.texture->width, args.texture->height, 1, pitch / RenderFormatSize(args.texture->format), allocation.offset));
+        RenderTextureCopyLocation::PlacedFootprint(allocation.buffer, args.texture->format, safeW, safeH, 1, dstPitch / RenderFormatSize(args.texture->format), allocation.offset));
 }
 
 static const char *DeviceTypeName(RenderDeviceType type)

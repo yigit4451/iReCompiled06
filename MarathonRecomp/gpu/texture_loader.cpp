@@ -1,5 +1,11 @@
 #include "video.h"
 
+#define BCDEC_STATIC
+#define BCDEC_IMPLEMENTATION
+#include "bcdec.h"
+
+#include <algorithm>
+#include <bit>
 #include <bc_diff.h>
 #include <decompressor.h>
 #include <kernel/function.h>
@@ -211,33 +217,283 @@ static RenderFormat ConvertDXGIFormat(ddspp::DXGIFormat format)
 #include <os/ios/memory_ios.h>
 #endif
 
-static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataSize, RenderComponentMapping componentMapping)
+static uint32_t ComputeMaxValidMipLevels(uint32_t width, uint32_t height, uint32_t depth = 1)
 {
-    ddspp::Descriptor ddsDesc;
-    if (ddspp::decode_header((unsigned char *)(data), ddsDesc) != ddspp::Error)
+    const uint32_t maxDim = std::max({ 1u, width, height, depth });
+    return static_cast<uint32_t>(std::bit_width(maxDim));
+}
+
+static bool IsBCCompressedFormat(RenderFormat format)
+{
+    switch (format)
     {
+    case RenderFormat::BC1_TYPELESS:
+    case RenderFormat::BC1_UNORM:
+    case RenderFormat::BC1_UNORM_SRGB:
+    case RenderFormat::BC2_TYPELESS:
+    case RenderFormat::BC2_UNORM:
+    case RenderFormat::BC2_UNORM_SRGB:
+    case RenderFormat::BC3_TYPELESS:
+    case RenderFormat::BC3_UNORM:
+    case RenderFormat::BC3_UNORM_SRGB:
+    case RenderFormat::BC4_TYPELESS:
+    case RenderFormat::BC4_UNORM:
+    case RenderFormat::BC4_SNORM:
+    case RenderFormat::BC5_TYPELESS:
+    case RenderFormat::BC5_UNORM:
+    case RenderFormat::BC5_SNORM:
+    case RenderFormat::BC6H_TYPELESS:
+    case RenderFormat::BC6H_UF16:
+    case RenderFormat::BC6H_SF16:
+    case RenderFormat::BC7_TYPELESS:
+    case RenderFormat::BC7_UNORM:
+    case RenderFormat::BC7_UNORM_SRGB:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool DecompressBCSliceToLinear(
+    RenderFormat bcFormat,
+    const uint8_t* srcBlocks,
+    uint32_t srcRowPitch,
+    uint32_t width,
+    uint32_t height,
+    uint8_t* dstLinear,
+    uint32_t dstRowPitch)
+{
+    const uint32_t safeW = std::max(1u, width);
+    const uint32_t safeH = std::max(1u, height);
+    const uint32_t blocksX = (safeW + 3u) / 4u;
+    const uint32_t blocksY = (safeH + 3u) / 4u;
+
+    uint32_t blockBytes = 16;
+    uint32_t dstBytesPerPixel = 4;
+    switch (bcFormat)
+    {
+    case RenderFormat::BC1_TYPELESS:
+    case RenderFormat::BC1_UNORM:
+    case RenderFormat::BC1_UNORM_SRGB:
+        blockBytes = BCDEC_BC1_BLOCK_SIZE;
+        dstBytesPerPixel = 4;
+        break;
+    case RenderFormat::BC4_TYPELESS:
+    case RenderFormat::BC4_UNORM:
+    case RenderFormat::BC4_SNORM:
+        blockBytes = BCDEC_BC4_BLOCK_SIZE;
+        dstBytesPerPixel = 1;
+        break;
+    case RenderFormat::BC5_TYPELESS:
+    case RenderFormat::BC5_UNORM:
+    case RenderFormat::BC5_SNORM:
+        blockBytes = BCDEC_BC5_BLOCK_SIZE;
+        dstBytesPerPixel = 2;
+        break;
+    case RenderFormat::BC6H_TYPELESS:
+    case RenderFormat::BC6H_UF16:
+    case RenderFormat::BC6H_SF16:
+        blockBytes = BCDEC_BC6H_BLOCK_SIZE;
+        dstBytesPerPixel = 8; // RGBA16F
+        break;
+    default:
+        blockBytes = 16;
+        dstBytesPerPixel = 4;
+        break;
+    }
+
+    alignas(16) uint8_t tileBuf[4 * 4 * 16] = {};
+
+    for (uint32_t by = 0; by < blocksY; ++by)
+    {
+        const uint8_t* srcRow = srcBlocks + static_cast<size_t>(by) * srcRowPitch;
+        for (uint32_t bx = 0; bx < blocksX; ++bx)
+        {
+            const uint8_t* blockPtr = srcRow + static_cast<size_t>(bx) * blockBytes;
+            const uint32_t pxX = bx * 4u;
+            const uint32_t pxY = by * 4u;
+            const bool fullTile = (pxX + 4u <= safeW) && (pxY + 4u <= safeH);
+
+            switch (bcFormat)
+            {
+            case RenderFormat::BC1_TYPELESS:
+            case RenderFormat::BC1_UNORM:
+            case RenderFormat::BC1_UNORM_SRGB:
+                if (fullTile)
+                    bcdec_bc1(blockPtr, dstLinear + static_cast<size_t>(pxY) * dstRowPitch + pxX * 4u, static_cast<int>(dstRowPitch));
+                else
+                    bcdec_bc1(blockPtr, tileBuf, 4 * 4);
+                break;
+
+            case RenderFormat::BC2_TYPELESS:
+            case RenderFormat::BC2_UNORM:
+            case RenderFormat::BC2_UNORM_SRGB:
+                if (fullTile)
+                    bcdec_bc2(blockPtr, dstLinear + static_cast<size_t>(pxY) * dstRowPitch + pxX * 4u, static_cast<int>(dstRowPitch));
+                else
+                    bcdec_bc2(blockPtr, tileBuf, 4 * 4);
+                break;
+
+            case RenderFormat::BC3_TYPELESS:
+            case RenderFormat::BC3_UNORM:
+            case RenderFormat::BC3_UNORM_SRGB:
+                if (fullTile)
+                    bcdec_bc3(blockPtr, dstLinear + static_cast<size_t>(pxY) * dstRowPitch + pxX * 4u, static_cast<int>(dstRowPitch));
+                else
+                    bcdec_bc3(blockPtr, tileBuf, 4 * 4);
+                break;
+
+            case RenderFormat::BC4_TYPELESS:
+            case RenderFormat::BC4_UNORM:
+            case RenderFormat::BC4_SNORM:
+                if (fullTile)
+                    bcdec_bc4(blockPtr, dstLinear + static_cast<size_t>(pxY) * dstRowPitch + pxX * 1u, static_cast<int>(dstRowPitch));
+                else
+                    bcdec_bc4(blockPtr, tileBuf, 4 * 1);
+                break;
+
+            case RenderFormat::BC5_TYPELESS:
+            case RenderFormat::BC5_UNORM:
+            case RenderFormat::BC5_SNORM:
+                if (fullTile)
+                    bcdec_bc5(blockPtr, dstLinear + static_cast<size_t>(pxY) * dstRowPitch + pxX * 2u, static_cast<int>(dstRowPitch));
+                else
+                    bcdec_bc5(blockPtr, tileBuf, 4 * 2);
+                break;
+
+            case RenderFormat::BC6H_TYPELESS:
+            case RenderFormat::BC6H_UF16:
+            case RenderFormat::BC6H_SF16:
+            {
+                // bcdec_bc6h_half outputs 3x uint16_t RGB per pixel; expand to RGBA16F (alpha = 1.0 half = 0x3C00)
+                uint16_t rgbHalf[4 * 4 * 3] = {};
+                const int isSigned = (bcFormat == RenderFormat::BC6H_SF16) ? 1 : 0;
+                bcdec_bc6h_half(blockPtr, rgbHalf, 4 * 3, isSigned);
+                uint16_t* rgbaHalf = reinterpret_cast<uint16_t*>(tileBuf);
+                for (uint32_t i = 0; i < 16; ++i)
+                {
+                    rgbaHalf[i * 4 + 0] = rgbHalf[i * 3 + 0];
+                    rgbaHalf[i * 4 + 1] = rgbHalf[i * 3 + 1];
+                    rgbaHalf[i * 4 + 2] = rgbHalf[i * 3 + 2];
+                    rgbaHalf[i * 4 + 3] = 0x3C00u;
+                }
+                const uint32_t copyW = std::min(4u, safeW - pxX);
+                const uint32_t copyH = std::min(4u, safeH - pxY);
+                for (uint32_t r = 0; r < copyH; ++r)
+                {
+                    std::memcpy(
+                        dstLinear + static_cast<size_t>(pxY + r) * dstRowPitch + static_cast<size_t>(pxX) * 8u,
+                        tileBuf + static_cast<size_t>(r) * 32u,
+                        static_cast<size_t>(copyW) * 8u);
+                }
+                continue;
+            }
+
+            case RenderFormat::BC7_TYPELESS:
+            case RenderFormat::BC7_UNORM:
+            case RenderFormat::BC7_UNORM_SRGB:
+                if (fullTile)
+                    bcdec_bc7(blockPtr, dstLinear + static_cast<size_t>(pxY) * dstRowPitch + pxX * 4u, static_cast<int>(dstRowPitch));
+                else
+                    bcdec_bc7(blockPtr, tileBuf, 4 * 4);
+                break;
+
+            default:
+                return false;
+            }
+
+            if (!fullTile)
+            {
+                const uint32_t copyW = std::min(4u, safeW - pxX);
+                const uint32_t copyH = std::min(4u, safeH - pxY);
+                const uint32_t tileRowBytes = 4u * dstBytesPerPixel;
+                for (uint32_t r = 0; r < copyH; ++r)
+                {
+                    std::memcpy(
+                        dstLinear + static_cast<size_t>(pxY + r) * dstRowPitch + static_cast<size_t>(pxX) * dstBytesPerPixel,
+                        tileBuf + static_cast<size_t>(r) * tileRowBytes,
+                        static_cast<size_t>(copyW) * dstBytesPerPixel);
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+static RenderFormat MapDecompressedBCFormat(RenderFormat bcFormat)
+{
+    switch (bcFormat)
+    {
+    case RenderFormat::BC4_TYPELESS:
+    case RenderFormat::BC4_UNORM:
+    case RenderFormat::BC4_SNORM:
+        return RenderFormat::R8_UNORM;
+    case RenderFormat::BC5_TYPELESS:
+    case RenderFormat::BC5_UNORM:
+    case RenderFormat::BC5_SNORM:
+        return RenderFormat::R8G8_UNORM;
+    case RenderFormat::BC6H_TYPELESS:
+    case RenderFormat::BC6H_UF16:
+    case RenderFormat::BC6H_SF16:
+        return RenderFormat::R16G16B16A16_FLOAT;
+    default:
+        return RenderFormat::R8G8B8A8_UNORM;
+    }
+}
+
+static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataSize, RenderComponentMapping componentMapping, bool allowMipClamp = false)
+{
+    if (data == nullptr || dataSize == 0)
+        return false;
+
+    ddspp::Descriptor ddsDesc;
+    if (dataSize >= sizeof(uint32_t) + sizeof(ddspp::Header) &&
+        ddspp::decode_header((unsigned char *)(data), ddsDesc) != ddspp::Error)
+    {
+        const uint32_t baseWidth = std::max(1u, ddsDesc.width);
+        const uint32_t baseHeight = std::max(1u, ddsDesc.height);
+        const uint32_t baseDepth = std::max(1u, ddsDesc.depth);
+        const uint32_t maxPossibleMips = ComputeMaxValidMipLevels(baseWidth, baseHeight, baseDepth);
+        const uint32_t safeNumMips = std::clamp(ddsDesc.numMips, 1u, maxPossibleMips);
+
         uint32_t startMip = 0;
 #ifdef MARATHON_RECOMP_IOS
-        if (ddsDesc.numMips > 1 && ddsDesc.type == ddspp::Texture2D && (ddsDesc.width >= 512 || ddsDesc.height >= 512))
+        // Apply Low4GB / Jetsam mip-0 skipping strictly to multi-mip game DDS textures (allowMipClamp && safeNumMips > 1),
+        // never to single-mip UI / ImGui textures loaded in InitImGuiUtils().
+        if (allowMipClamp && safeNumMips > 1 && ddsDesc.type == ddspp::Texture2D && (baseWidth >= 512 || baseHeight >= 512))
         {
             const auto& budget = os::ios::GetMemoryBudget();
             const uint64_t liveBytes = g_liveTextureBytes.load(std::memory_order_relaxed);
             const bool overSoftCap = liveBytes >= (budget.texturePoolMaxBytes * 3) / 4;
-            const bool largeOn4GB = (budget.tier == os::ios::DeviceMemoryTier::Low4GB) && (ddsDesc.width >= 1024 || ddsDesc.height >= 1024);
+            const bool largeOn4GB = (budget.tier == os::ios::DeviceMemoryTier::Low4GB) && (baseWidth >= 1024 || baseHeight >= 1024);
 
             if (largeOn4GB || overSoftCap || os::ios::IsJetsamPressureHigh())
                 startMip = 1;
+        }
+#else
+        (void)allowMipClamp;
+#endif
+
+        const RenderFormat rawFormat = ConvertDXGIFormat(ddsDesc.format);
+        bool decompressBCOnCPU = false;
+#ifdef MARATHON_RECOMP_IOS
+        if (IsBCCompressedFormat(rawFormat) && !os::ios::SupportsNativeBCTextures())
+        {
+            decompressBCOnCPU = true;
         }
 #endif
 
         RenderTextureDesc desc;
         desc.dimension = ConvertTextureDimension(ddsDesc.type);
-        desc.width = std::max(1u, ddsDesc.width >> startMip);
-        desc.height = std::max(1u, ddsDesc.height >> startMip);
-        desc.depth = std::max(1u, ddsDesc.depth >> startMip);
-        desc.mipLevels = ddsDesc.numMips - startMip;
-        desc.arraySize = ddsDesc.type == ddspp::TextureType::Cubemap ? ddsDesc.arraySize * 6 : ddsDesc.arraySize;
-        desc.format = ConvertDXGIFormat(ddsDesc.format);
+        desc.width = std::max(1u, baseWidth >> startMip);
+        desc.height = std::max(1u, baseHeight >> startMip);
+        desc.depth = std::max(1u, baseDepth >> startMip);
+        const uint32_t maxValidMipsForClampedSize = ComputeMaxValidMipLevels(desc.width, desc.height, desc.depth);
+        desc.mipLevels = std::clamp(safeNumMips - startMip, 1u, maxValidMipsForClampedSize);
+        const uint32_t baseArraySize = std::max(1u, ddsDesc.arraySize);
+        desc.arraySize = ddsDesc.type == ddspp::TextureType::Cubemap ? baseArraySize * 6u : baseArraySize;
+        desc.format = decompressBCOnCPU ? MapDecompressedBCFormat(rawFormat) : rawFormat;
         desc.flags = ddsDesc.type == ddspp::TextureType::Cubemap ? RenderTextureFlag::CUBE : RenderTextureFlag::NONE;
 
         RenderTextureViewDesc viewDesc;
@@ -255,6 +511,11 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
 
         texture.type = ResourceType::Texture;
         texture.textureHolder = Video::GetRenderDevice()->createTexture(desc);
+        if (!texture.textureHolder)
+        {
+            LOGFN_ERROR("Failed to create host texture ({}x{}, mips={}, fmt={})", desc.width, desc.height, desc.mipLevels, static_cast<uint32_t>(desc.format));
+            return false;
+        }
         texture.texture = texture.textureHolder.get();
         texture.layout = RenderTextureLayout::COPY_DEST;
         texture.textureView = texture.texture->createTextureView(viewDesc);
@@ -263,6 +524,8 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
 
         texture.width = desc.width;
         texture.height = desc.height;
+        texture.depth = desc.depth;
+        texture.format = desc.format;
         texture.mipLevels = viewDesc.mipLevels;
         texture.viewDimension = viewDesc.dimension;
 
@@ -276,26 +539,27 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
             uint32_t srcRowPitch;
             uint32_t dstRowPitch;
             uint32_t rowCount;
+            uint32_t dstRowWidthPixels;
         };
 
         std::vector<Slice> slices;
         uint32_t curSrcOffset = 0;
         uint32_t curDstOffset = 0;
+        const uint32_t dstPixelBytes = RenderFormatSize(desc.format);
 
         for (uint32_t arraySlice = 0; arraySlice < desc.arraySize; arraySlice++)
         {
             for (uint32_t mipSlice = 0; mipSlice < ddsDesc.numMips; mipSlice++)
             {
-                const uint32_t sliceWidth = std::max(1u, ddsDesc.width >> mipSlice);
-                const uint32_t sliceHeight = std::max(1u, ddsDesc.height >> mipSlice);
-                const uint32_t sliceDepth = std::max(1u, ddsDesc.depth >> mipSlice);
+                const uint32_t sliceWidth = std::max(1u, baseWidth >> mipSlice);
+                const uint32_t sliceHeight = std::max(1u, baseHeight >> mipSlice);
+                const uint32_t sliceDepth = std::max(1u, baseDepth >> mipSlice);
                 const uint32_t rowPitch = ((sliceWidth + ddsDesc.blockWidth - 1) / ddsDesc.blockWidth) * ddsDesc.bitsPerPixelOrBlock;
                 const uint32_t srcRowPitch = (rowPitch + 7) / 8;
-                const uint32_t dstRowPitch = (srcRowPitch + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
-                const uint32_t rowCount = (sliceHeight + ddsDesc.blockHeight - 1) / ddsDesc.blockHeight;
-                const uint32_t srcBytes = srcRowPitch * rowCount * sliceDepth;
+                const uint32_t srcRowCount = (sliceHeight + ddsDesc.blockHeight - 1) / ddsDesc.blockHeight;
+                const uint32_t srcBytes = srcRowPitch * srcRowCount * sliceDepth;
 
-                if (mipSlice >= startMip)
+                if (mipSlice >= startMip && (mipSlice - startMip) < desc.mipLevels)
                 {
                     auto& slice = slices.emplace_back();
                     slice.width = sliceWidth;
@@ -304,16 +568,28 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
                     slice.srcOffset = curSrcOffset;
                     slice.dstOffset = curDstOffset;
                     slice.srcRowPitch = srcRowPitch;
-                    slice.dstRowPitch = dstRowPitch;
-                    slice.rowCount = rowCount;
 
-                    curDstOffset += (dstRowPitch * rowCount * sliceDepth + PLACEMENT_ALIGNMENT - 1) & ~(PLACEMENT_ALIGNMENT - 1);
+                    if (decompressBCOnCPU)
+                    {
+                        slice.dstRowPitch = (sliceWidth * dstPixelBytes + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
+                        slice.rowCount = sliceHeight;
+                        slice.dstRowWidthPixels = slice.dstRowPitch / std::max(1u, dstPixelBytes);
+                    }
+                    else
+                    {
+                        slice.dstRowPitch = (srcRowPitch + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
+                        slice.rowCount = srcRowCount;
+                        slice.dstRowWidthPixels = (slice.dstRowPitch * 8) / ddsDesc.bitsPerPixelOrBlock * ddsDesc.blockWidth;
+                    }
+
+                    curDstOffset += (slice.dstRowPitch * slice.rowCount * sliceDepth + PLACEMENT_ALIGNMENT - 1) & ~(PLACEMENT_ALIGNMENT - 1);
                 }
 
                 curSrcOffset += srcBytes;
             }
         }
 
+        curDstOffset = std::max<uint32_t>(curDstOffset, PLACEMENT_ALIGNMENT);
         texture.allocatedBytes = curDstOffset;
         g_liveTextureBytes.fetch_add(texture.allocatedBytes, std::memory_order_relaxed);
 
@@ -322,10 +598,29 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
 
         for (auto& slice : slices)
         {
+            if (ddsDesc.headerSize + slice.srcOffset >= dataSize)
+                break;
+
             const uint8_t* srcData = data + ddsDesc.headerSize + slice.srcOffset;
             uint8_t* dstData = mappedMemory + slice.dstOffset;
 
-            if (slice.srcRowPitch == slice.dstRowPitch)
+            if (decompressBCOnCPU)
+            {
+                const size_t srcSlicePitch = static_cast<size_t>(slice.srcRowPitch) * ((slice.height + ddsDesc.blockHeight - 1) / ddsDesc.blockHeight);
+                const size_t dstSlicePitch = static_cast<size_t>(slice.dstRowPitch) * slice.height;
+                for (uint32_t z = 0; z < slice.depth; ++z)
+                {
+                    DecompressBCSliceToLinear(
+                        rawFormat,
+                        srcData + z * srcSlicePitch,
+                        slice.srcRowPitch,
+                        slice.width,
+                        slice.height,
+                        dstData + z * dstSlicePitch,
+                        slice.dstRowPitch);
+                }
+            }
+            else if (slice.srcRowPitch == slice.dstRowPitch)
             {
                 memcpy(dstData, srcData, slice.srcRowPitch * slice.rowCount * slice.depth);
             }
@@ -351,48 +646,61 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
                 auto& slice = slices[i];
 
                 in_pCommandList->copyTextureRegion(
-                    RenderTextureCopyLocation::Subresource(texture.texture, i % desc.mipLevels, i / desc.mipLevels),
-                    RenderTextureCopyLocation::PlacedFootprint(uploadBuffer.get(), desc.format, slice.width, slice.height, slice.depth, (slice.dstRowPitch * 8) / ddsDesc.bitsPerPixelOrBlock * ddsDesc.blockWidth, slice.dstOffset));
+                    RenderTextureCopyLocation::Subresource(texture.texture, static_cast<uint32_t>(i % desc.mipLevels), static_cast<uint32_t>(i / desc.mipLevels)),
+                    RenderTextureCopyLocation::PlacedFootprint(uploadBuffer.get(), desc.format, slice.width, slice.height, slice.depth, slice.dstRowWidthPixels, slice.dstOffset));
             }
         });
 
         return true;
     }
 
-    int width, height;
-    void* stbImage = stbi_load_from_memory(data, dataSize, &width, &height, nullptr, 4);
+    int width = 0, height = 0;
+    void* stbImage = stbi_load_from_memory(data, static_cast<int>(dataSize), &width, &height, nullptr, 4);
 
     if (stbImage != nullptr)
     {
+        const uint32_t safeW = std::max(1u, static_cast<uint32_t>(std::max(1, width)));
+        const uint32_t safeH = std::max(1u, static_cast<uint32_t>(std::max(1, height)));
+
         texture.type = ResourceType::Texture;
-        texture.textureHolder = Video::GetRenderDevice()->createTexture(RenderTextureDesc::Texture2D(width, height, 1, RenderFormat::R8G8B8A8_UNORM));
+        texture.textureHolder = Video::GetRenderDevice()->createTexture(RenderTextureDesc::Texture2D(safeW, safeH, 1, RenderFormat::R8G8B8A8_UNORM));
+        if (!texture.textureHolder)
+        {
+            stbi_image_free(stbImage);
+            return false;
+        }
         texture.texture = texture.textureHolder.get();
+        texture.width = safeW;
+        texture.height = safeH;
+        texture.depth = 1;
+        texture.mipLevels = 1;
+        texture.format = RenderFormat::R8G8B8A8_UNORM;
         texture.viewDimension = RenderTextureViewDimension::TEXTURE_2D;
         texture.layout = RenderTextureLayout::COPY_DEST;
 
         texture.descriptorIndex = g_textureDescriptorAllocator.allocate();
         g_textureDescriptorSet->setTexture(texture.descriptorIndex, texture.texture, RenderTextureLayout::SHADER_READ);
 
-        uint32_t rowPitch = (width * 4 + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
-        uint32_t slicePitch = rowPitch * height;
+        uint32_t rowPitch = (safeW * 4 + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
+        uint32_t slicePitch = rowPitch * safeH;
         texture.allocatedBytes = slicePitch;
         g_liveTextureBytes.fetch_add(texture.allocatedBytes, std::memory_order_relaxed);
 
         auto uploadBuffer = Video::GetRenderDevice()->createBuffer(RenderBufferDesc::UploadBuffer(slicePitch));
         auto mappedMemory = static_cast<uint8_t*>(uploadBuffer->map());
 
-        if (rowPitch == (width * 4))
+        if (rowPitch == (safeW * 4))
         {
             memcpy(mappedMemory, stbImage, slicePitch);
         }
         else
         {
-            auto data = static_cast<const uint8_t*>(stbImage);
+            auto srcPtr = static_cast<const uint8_t*>(stbImage);
 
-            for (size_t i = 0; i < height; i++)
+            for (size_t i = 0; i < safeH; i++)
             {
-                memcpy(mappedMemory, data, width * 4);
-                data += width * 4;
+                memcpy(mappedMemory, srcPtr, safeW * 4);
+                srcPtr += safeW * 4;
                 mappedMemory += rowPitch;
             }
         }
@@ -406,8 +714,8 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
             in_pCommandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(texture.texture, RenderTextureLayout::COPY_DEST));
 
             in_pCommandList->copyTextureRegion(
-            RenderTextureCopyLocation::Subresource(texture.texture, 0),
-            RenderTextureCopyLocation::PlacedFootprint(uploadBuffer.get(), RenderFormat::R8G8B8A8_UNORM, width, height, 1, rowPitch / 4, 0));
+                RenderTextureCopyLocation::Subresource(texture.texture, 0),
+                RenderTextureCopyLocation::PlacedFootprint(uploadBuffer.get(), RenderFormat::R8G8B8A8_UNORM, safeW, safeH, 1, rowPitch / 4, 0));
         });
 
         return true;
@@ -458,7 +766,7 @@ static void DiffPatchTexture(GuestTexture& texture, uint8_t* data, uint32_t data
 
         GuestTexture patchedTexture;
 
-        if (LoadTexture(patchedTexture, data, dataSize, {}))
+        if (LoadTexture(patchedTexture, data, dataSize, {}, true))
             texture.patchedTexture = std::make_unique<GuestTexture>(std::move(patchedTexture));
     }
 }
@@ -469,7 +777,7 @@ static void MakePictureData(Sonicteam::MyTexture* pictureData, uint8_t* data, ui
     {
         GuestTexture texture;
 
-        if (LoadTexture(texture, data, dataSize, {}))
+        if (LoadTexture(texture, data, dataSize, {}, true))
         {
 #ifdef _DEBUG
             if (pictureData->m_MgrResourceName.size() > 0)
