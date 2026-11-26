@@ -129,6 +129,209 @@ void KiSystemStartup()
 
 uint32_t LdrLoadModule(const std::filesystem::path &path)
 {
+    GuestModuleDiagnostics diag{};
+    diag.modulePath = path.string();
+
+    std::error_code existsEc;
+    if (g_memory.base == nullptr)
+    {
+        diag.loaderStatus = "g_memory.base NULL; 4 GiB guest sanal bellek penceresi ayrilamadi";
+        GuestSetModuleDiagnostics(diag);
+        return 0;
+    }
+
+    const auto loadResult = LoadFile(path);
+    if (loadResult.empty())
+    {
+        diag.loaderStatus = std::filesystem::exists(path, existsEc)
+            ? "Dosya mevcut ama okunamadi/bos (LoadFile bos dondu)"
+            : "Dosya bulunamadi (default.xex / decrypted/default.bin yok)";
+        GuestSetModuleDiagnostics(diag);
+        return 0;
+    }
+
+    DecryptedExecutableHeader header{};
+    memcpy(&header, loadResult.data(), std::min(sizeof(header), loadResult.size()));
+    if (header.magic == DECRYPTED_EXECUTABLE_MAGIC) {
+        LOG_UTILITY("Loading pre-decrypted executable");
+
+        const size_t payloadSize = loadResult.size() - sizeof(DecryptedExecutableHeader);
+        diag.entryPoint = header.entry_point;
+        diag.imageBase = header.base;
+        diag.imageSize = static_cast<uint32_t>(payloadSize);
+
+        if (header.base < PPC_IMAGE_BASE || payloadSize > PPC_MEMORY_SIZE - header.base)
+        {
+            diag.loaderStatus = "Decrypted imaj PPC bellek penceresine sigmiyor";
+            GuestSetModuleDiagnostics(diag);
+            return 0;
+        }
+
+        memcpy(g_memory.Translate(header.base), loadResult.data() + sizeof(DecryptedExecutableHeader),
+               payloadSize);
+        g_xdbfWrapper = XDBFWrapper(static_cast<uint8_t*>(g_memory.Translate(header.resource_offset)), header.resource_size);
+
+        diag.loaderStatus = payloadSize > PPC_IMAGE_SIZE
+            ? "Decrypted imaj yuklendi (UYARI: imaj boyutu PPC_IMAGE_SIZE'dan buyuk; fonksiyon tablosu ile cakisabilir)"
+            : "Decrypted imaj yuklendi";
+        GuestSetModuleDiagnostics(diag);
+        return header.entry_point;
+    } else {
+        LOG_UTILITY("Loading XEX executable");
+        const auto image = Image::ParseImage(loadResult.data(), loadResult.size());
+
+        diag.entryPoint = image.entry_point;
+        diag.imageBase = image.base;
+        diag.imageSize = static_cast<uint32_t>(image.size);
+
+        if (image.data == nullptr || image.size == 0 || image.base < PPC_IMAGE_BASE ||
+            image.size > PPC_MEMORY_SIZE - image.base)
+        {
+            diag.loaderStatus = "XEX ayristirilamadi (sifreli/bozuk default.xex) veya PPC bellek penceresine sigmiyor";
+            GuestSetModuleDiagnostics(diag);
+            return 0;
+        }
+
+        memcpy(g_memory.Translate(image.base), image.data.get(), image.size);
+        g_xdbfWrapper = XDBFWrapper(static_cast<uint8_t*>(g_memory.Translate(image.resource_offset)), image.resource_size);
+
+        diag.loaderStatus = image.size > PPC_IMAGE_SIZE
+            ? "XEX yuklendi (UYARI: imaj boyutu PPC_IMAGE_SIZE'dan buyuk; fonksiyon tablosu ile cakisabilir)"
+            : "XEX yuklendi";
+        GuestSetModuleDiagnostics(diag);
+        return image.entry_point;
+    }
+}
+
+#ifdef __x86_64__
+#include <cpuid.h>
+#endif
+#include <cpu/guest_thread.h>
+#include <gpu/imgui/imgui_snapshot.h>
+#include <gpu/video.h>
+#include <kernel/function.h>
+#include <kernel/memory.h>
+#include <kernel/heap.h>
+#include <kernel/xam.h>
+#include <kernel/io/file_system.h>
+#include <file.h>
+#include <vector>
+#include <image.h>
+#include <apu/audio.h>
+#include <hid/hid.h>
+#include <user/config.h>
+#include <user/paths.h>
+#include <user/registry.h>
+#include <kernel/xdbf.h>
+#include <install/installer.h>
+#include <install/update_checker.h>
+#include <os/logger.h>
+#include <os/process.h>
+#include <os/registry.h>
+#include <ui/game_window.h>
+#include <ui/installer_wizard.h>
+#include <mod/mod_loader.h>
+#include <preload_executable.h>
+#include <iostream>
+#include <app.h>
+
+#ifdef _WIN32
+#include <timeapi.h>
+#endif
+
+#if defined(_WIN32) && defined(MARATHON_RECOMP_D3D12)
+static std::array<std::string_view, 3> g_D3D12RequiredModules =
+{
+    "D3D12/D3D12Core.dll",
+    "dxcompiler.dll",
+    "dxil.dll"
+};
+#endif
+
+const size_t XMAIOBegin = 0x7FEA0000;
+const size_t XMAIOEnd = XMAIOBegin + 0x0000FFFF;
+
+Memory g_memory;
+Heap g_userHeap;
+XDBFWrapper g_xdbfWrapper;
+std::unordered_map<uint16_t, GuestTexture*> g_xdbfTextureCache;
+
+void HostStartup()
+{
+#ifdef _WIN32
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+#endif
+
+    HID::GetManager()->Init();
+}
+
+// Name inspired from nt's entry point
+void KiSystemStartup()
+{
+    if (g_memory.base == nullptr)
+    {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("System_MemoryAllocationFailed").c_str(), GameWindow::s_pWindow);
+        std::_Exit(1);
+    }
+
+    g_userHeap.Init();
+
+    const auto gameContent = XamMakeContent(XCONTENTTYPE_RESERVED, "Game");
+    const std::string gamePath = (const char*)(GetGamePath() / "game").u8string().c_str();
+
+    BuildPathCache(gamePath);
+
+    XamRegisterContent(gameContent, gamePath);
+
+    const auto saveFilePath = GetSaveFilePath(true);
+    bool saveFileExists = std::filesystem::exists(saveFilePath);
+
+    if (!saveFileExists)
+    {
+        // Copy base save data to modded save as fallback.
+        std::error_code ec;
+        std::filesystem::create_directories(saveFilePath.parent_path(), ec);
+
+        if (!ec)
+        {
+            std::filesystem::copy_file(GetSaveFilePath(false), saveFilePath, ec);
+            saveFileExists = !ec;
+        }
+    }
+
+    if (saveFileExists)
+    {
+        std::u8string savePathU8 = saveFilePath.parent_path().u8string();
+        XamRegisterContent(XamMakeContent(XCONTENTTYPE_SAVEDATA, "SonicNextSaveData.bin"), (const char*)(savePathU8.c_str()));
+    }
+
+    // Mount game
+    XamContentCreateEx(0, "game", &gameContent, OPEN_EXISTING, nullptr, nullptr, 0, 0, nullptr);
+
+    // OS mounts game data to D:
+    XamContentCreateEx(0, "D", &gameContent, OPEN_EXISTING, nullptr, nullptr, 0, 0, nullptr);
+
+    std::error_code ec;
+    for (auto& file : std::filesystem::directory_iterator(GetGamePath() / "dlc", ec))
+    {
+        if (file.is_directory())
+        {
+            // Only include directories with valid DLC content, otherwise the game will try to load it and error.
+            const auto arcFile = file.path() / "download.arc";
+            if (std::filesystem::exists(arcFile))
+            {
+                std::u8string fileNameU8 = file.path().filename().u8string();
+                std::u8string filePathU8 = file.path().u8string();
+                XamRegisterContent(XamMakeContent(XCONTENTTYPE_DLC, (const char*)(fileNameU8.c_str())), (const char*)(filePathU8.c_str()));
+            }
+        }
+    }
+
+    XAudioInitializeSystem();
+}
+
+uint32_t LdrLoadModule(const std::filesystem::path &path)
+{
     const auto loadResult = LoadFile(path);
     if (loadResult.empty())
     {
@@ -196,6 +399,18 @@ extern "C" MARATHON_CORE_API const char* MarathonGetDocumentsPath(void)
     static std::string s_docsPath = GetGamePath().string();
 #endif
     return s_docsPath.c_str();
+}
+
+static std::string s_marathonLastError;
+
+static void SetMarathonLastError(const std::string& message)
+{
+    s_marathonLastError = message;
+}
+
+extern "C" MARATHON_CORE_API const char* MarathonGetLastErrorMessage(void)
+{
+    return s_marathonLastError.c_str();
 }
 
 extern "C" MARATHON_CORE_API const char* MarathonGetApplicationSupportPath(void)
@@ -365,6 +580,14 @@ extern "C" MARATHON_CORE_API int MarathonMain(int argc, char** argv)
     LOGN_WARNING(modulePath.string());
 
     GuestThread::Start({ entry, 0, 0 });
+
+    if (GuestHasFatalError())
+    {
+        const std::string report = GuestGetFatalError();
+        SetMarathonLastError(report);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "iReCompiled06 - Guest Hatasi", report.c_str(), GameWindow::s_pWindow);
+        return 3;
+    }
 
     return 0;
 }

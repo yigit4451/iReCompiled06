@@ -43,6 +43,12 @@ MARATHON_CORE_API const char* MarathonGetApplicationSupportPath(void);
  */
 MARATHON_CORE_API bool MarathonIsGameInstalled(void);
 
+/**
+ * Returns the last fatal guest/engine diagnostic message (UTF-8, empty when none),
+ * e.g. the missing guest function address report produced by GuestThread::Start.
+ */
+MARATHON_CORE_API const char* MarathonGetLastErrorMessage(void);
+
 #ifdef __cplusplus
 }
 #endif

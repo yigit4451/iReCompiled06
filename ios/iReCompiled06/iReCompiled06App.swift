@@ -18,7 +18,7 @@ final class MarathonLaunchController {
         case checkingSandbox
         case setupWizard
         case runningEngine
-        case engineExited(Int32)
+        case engineExited(Int32, String)
     }
 
     var phase: Phase = .checkingSandbox
@@ -56,7 +56,8 @@ final class MarathonLaunchController {
             UIApplication.shared.isIdleTimerDisabled = false
             if exitCode != 0 {
                 self?.didStartEngine = false
-                self?.phase = .engineExited(exitCode)
+                let detail = String(cString: MarathonGetLastErrorMessage())
+                self?.phase = .engineExited(exitCode, detail)
             }
         }
     }
@@ -108,9 +109,10 @@ struct iReCompiled06App: App {
                         subtitle: "SDL3 + Metal / MoltenVK tam ekran penceresine geçiliyor..."
                     )
 
-                case .engineExited(let code):
+                case .engineExited(let code, let detail):
                     EngineErrorRecoveryView(
                         exitCode: code,
+                        detail: detail,
                         onReopenWizard: {
                             launchController.phase = .setupWizard
                         },
@@ -155,6 +157,7 @@ private struct EngineTransitionPlaceholderView: View {
 
 private struct EngineErrorRecoveryView: View {
     let exitCode: Int32
+    let detail: String
     let onReopenWizard: () -> Void
     let onRetryLaunch: () -> Void
 
@@ -173,6 +176,19 @@ private struct EngineErrorRecoveryView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 480)
+
+            if !detail.isEmpty {
+                ScrollView(.vertical) {
+                    Text(detail)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: 560, maxHeight: 220)
+                .padding(10)
+                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+            }
 
             HStack(spacing: 14) {
                 Button("Kurulum Sihirbazını Aç", action: onReopenWizard)

@@ -7,6 +7,12 @@
 #include <kernel/function.h>
 #include <os/logger.h>
 #include "ppc_context.h"
+#include <mutex>
+#include <atomic>
+#include <filesystem>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 constexpr size_t PCR_SIZE = 0xAB0;
 constexpr size_t TLS_SIZE = 0x100;
@@ -41,6 +47,98 @@ GuestThreadContext::GuestThreadContext(uint32_t cpuNumber)
 GuestThreadContext::~GuestThreadContext()
 {
     g_userHeap.Free(thread);
+}
+
+static std::mutex g_guestDiagMutex;
+static GuestModuleDiagnostics g_guestModuleDiag;
+static std::string g_guestFatalError;
+static std::atomic<bool> g_guestHasFatalError{false};
+
+void GuestSetModuleDiagnostics(const GuestModuleDiagnostics& diagnostics)
+{
+    std::lock_guard lock(g_guestDiagMutex);
+    g_guestModuleDiag = diagnostics;
+}
+
+std::string GuestBuildMissingFunctionReport(uint32_t guestAddress)
+{
+    GuestModuleDiagnostics diag;
+    {
+        std::lock_guard lock(g_guestDiagMutex);
+        diag = g_guestModuleDiag;
+    }
+
+    size_t mappingCount = 0;
+    for (size_t i = 0; PPCFuncMappings[i].guest != 0; i++)
+        mappingCount++;
+
+    // A full XenonRecomp build registers tens of thousands of functions. Public CI builds without
+    // MarathonRecompLib/private/default.xex only register the ~hundreds of host hooks (stub build).
+    const bool looksLikeStubBuild = mappingCount < 5000;
+
+    std::error_code ec;
+    const auto cwd = std::filesystem::current_path(ec);
+
+    std::string report = fmt::format(
+        "Guest fonksiyonu bulunamadi (nullptr)\n"
+        "- Eksik guest_address (params.function): 0x{:08X}\n"
+        "- XEX entryPoint: 0x{:08X}\n"
+        "- Imaj base/size: 0x{:08X} / 0x{:X} (PPC_IMAGE_BASE=0x{:X}, PPC_IMAGE_SIZE=0x{:X}, PPC_CODE_SIZE=0x{:X})\n"
+        "- Yuklenen modul: {}\n"
+        "- Modul yukleme durumu: {}\n"
+        "- Calisma dizini (cwd): {}\n"
+        "- PPCFuncMappings kayit sayisi: {}\n"
+        "- g_memory.base: {}\n",
+        guestAddress, diag.entryPoint, diag.imageBase, diag.imageSize,
+        (unsigned long long)PPC_IMAGE_BASE, (unsigned long long)PPC_IMAGE_SIZE, (unsigned long long)PPC_CODE_SIZE,
+        diag.modulePath.empty() ? "<yok>" : diag.modulePath,
+        diag.loaderStatus.empty() ? "<bilinmiyor>" : diag.loaderStatus,
+        ec ? "<alinamadi>" : cwd.string(),
+        mappingCount,
+        g_memory.base != nullptr ? "eslenmis" : "NULL (bellek ayrilamadi)");
+
+    if (looksLikeStubBuild)
+    {
+        report += "\nUYARI: Bu IPA, MarathonRecompLib/private/default.xex olmadan 'stub' PPC tablosuyla "
+                  "derlenmis (yalnizca host hook'lari kayitli). Oyun kodu (XenonRecomp ciktisi) pakette "
+                  "yok; ASSET_REPO / ASSET_REPO_TOKEN GitHub secret'lari tanimlanip CI yeniden "
+                  "calistirilmalidir.\n";
+    }
+    else if (guestAddress == 0)
+    {
+        report += "\nNOT: Giris noktasi 0; default.xex / decrypted/default.bin yuklenemedi veya bos.\n";
+    }
+    else if (guestAddress < PPC_CODE_BASE || guestAddress >= PPC_CODE_BASE + PPC_CODE_SIZE)
+    {
+        report += "\nNOT: Adres PPC_CODE_BASE..PPC_CODE_BASE+PPC_CODE_SIZE araliginin disinda; "
+                  "XEX, recomp edilen surumle uyusmuyor olabilir (farkli TU/title update).\n";
+    }
+
+    return report;
+}
+
+void GuestReportFatalError(const std::string& message)
+{
+    {
+        std::lock_guard lock(g_guestDiagMutex);
+        if (g_guestFatalError.empty())
+            g_guestFatalError = message;
+    }
+    g_guestHasFatalError.store(true);
+
+    fprintf(stderr, "[iReCompiled06][FATAL] %s\n", message.c_str());
+    LOGFN_ERROR("{}", message);
+}
+
+bool GuestHasFatalError()
+{
+    return g_guestHasFatalError.load();
+}
+
+std::string GuestGetFatalError()
+{
+    std::lock_guard lock(g_guestDiagMutex);
+    return g_guestFatalError;
 }
 
 static std::string GetGuestThreadName(const GuestThreadParams& params)
@@ -116,10 +214,19 @@ uint32_t GuestThread::Start(const GuestThreadParams& params)
     const auto procMask = (uint8_t)(params.flags >> 24);
     const auto cpuNumber = procMask == 0 ? 0 : 7 - std::countl_zero(procMask);
 
+    // Never jump to a null host function pointer (EXC_BAD_ACCESS at pc 0x0): report why instead.
+    const bool inCodeRange = params.function >= PPC_CODE_BASE && params.function <= PPC_CODE_BASE + PPC_CODE_SIZE;
+    PPCFunc* hostFunction = (g_memory.base != nullptr && inCodeRange) ? g_memory.FindFunction(params.function) : nullptr;
+    if (hostFunction == nullptr)
+    {
+        GuestReportFatalError(GuestBuildMissingFunctionReport(params.function));
+        return 0xFFFFFFFFu;
+    }
+
     GuestThreadContext ctx(cpuNumber);
     ctx.ppcContext.r3.u64 = params.value;
 
-    g_memory.FindFunction(params.function)(ctx.ppcContext, g_memory.base);
+    hostFunction(ctx.ppcContext, g_memory.base);
 
     return ctx.ppcContext.r3.u32;
 }

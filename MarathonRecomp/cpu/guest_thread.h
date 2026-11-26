@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdint>
+#include <string>
+
 #include <kernel/xdm.h>
 #include <utils/host_thread.h>
 
@@ -35,6 +38,26 @@ struct GuestThreadHandle : KernelObject
 
     uint32_t Wait(uint32_t timeout) override;
 };
+
+// Diagnostics for guest function resolution failures (nullptr in the PPC function table).
+struct GuestModuleDiagnostics
+{
+    uint32_t entryPoint = 0;
+    uint32_t imageBase = 0;
+    uint32_t imageSize = 0;
+    std::string modulePath;
+    std::string loaderStatus;
+};
+
+void GuestSetModuleDiagnostics(const GuestModuleDiagnostics& diagnostics);
+
+// Builds a human readable report for a guest address that has no host function registered.
+std::string GuestBuildMissingFunctionReport(uint32_t guestAddress);
+
+// Records a fatal guest error (logs it and keeps it for the host UI). Thread-safe.
+void GuestReportFatalError(const std::string& message);
+bool GuestHasFatalError();
+std::string GuestGetFatalError();
 
 struct GuestThread
 {
