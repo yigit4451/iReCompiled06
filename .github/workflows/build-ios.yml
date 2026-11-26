@@ -33,10 +33,20 @@ jobs:
         run: |
           if [ -n "${ASSET_REPO}" ] && [ -n "${ASSET_REPO_TOKEN}" ]; then
             echo "Cloning private asset repository ${ASSET_REPO}..."
-            git clone --depth=1 "https://x-access-token:${ASSET_REPO_TOKEN}@github.com/${ASSET_REPO}.git" ./private_assets
+            if printf '%s' "${ASSET_REPO_TOKEN}" | grep -q "PRIVATE KEY"; then
+              KEY_FILE="${RUNNER_TEMP}/asset_repo_deploy_key"
+              printf '%s\n' "${ASSET_REPO_TOKEN}" > "${KEY_FILE}"
+              chmod 600 "${KEY_FILE}"
+              GIT_SSH_COMMAND="ssh -i ${KEY_FILE} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+                git clone --depth=1 "git@github.com:${ASSET_REPO}.git" ./private_assets
+              rm -f "${KEY_FILE}"
+            else
+              git clone --depth=1 "https://x-access-token:${ASSET_REPO_TOKEN}@github.com/${ASSET_REPO}.git" ./private_assets
+            fi
             mkdir -p ./MarathonRecompLib/private
             cp -R ./private_assets/* ./MarathonRecompLib/private/
             rm -rf ./private_assets
+            ls -lh ./MarathonRecompLib/private/default.xex ./MarathonRecompLib/private/shader.arc ./MarathonRecompLib/private/shader_lt.arc
           else
             echo "No ASSET_REPO secret configured; CMake will use tools/generate_stub_recomp.py fallback."
           fi
