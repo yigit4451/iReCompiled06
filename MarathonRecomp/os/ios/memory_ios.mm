@@ -4,10 +4,14 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <UIKit/UIKit.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <dispatch/dispatch.h>
+#include <mutex>
 #include <os/proc.h>
+#include <signal.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 namespace
@@ -18,6 +22,60 @@ namespace
     std::atomic<bool> g_memoryWarningPending{ false };
     std::once_flag g_observerOnceFlag;
     dispatch_source_t g_memoryPressureSource = nullptr;
+
+    std::atomic<uintptr_t> g_guestFaultBase{ 0 };
+    std::atomic<size_t> g_guestFaultSize{ 0 };
+    std::atomic<size_t> g_guestFaultPageSize{ 16384U };
+    std::once_flag g_faultHandlerOnceFlag;
+    struct sigaction g_prevSigbusAction{};
+    struct sigaction g_prevSigsegvAction{};
+
+    void ForwardUnhandledSignal(int sig, siginfo_t* info, void* ucontext, const struct sigaction& prev)
+    {
+        if ((prev.sa_flags & SA_SIGINFO) != 0 && prev.sa_sigaction != nullptr &&
+            prev.sa_sigaction != reinterpret_cast<void (*)(int, siginfo_t*, void*)>(SIG_IGN) &&
+            prev.sa_sigaction != reinterpret_cast<void (*)(int, siginfo_t*, void*)>(SIG_DFL))
+        {
+            prev.sa_sigaction(sig, info, ucontext);
+            return;
+        }
+
+        if (prev.sa_handler != nullptr && prev.sa_handler != SIG_IGN && prev.sa_handler != SIG_DFL)
+        {
+            prev.sa_handler(sig);
+            return;
+        }
+
+        struct sigaction dfl{};
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        sigaction(sig, &dfl, nullptr);
+        raise(sig);
+    }
+
+    void GuestMemorySignalHandler(int sig, siginfo_t* info, void* ucontext)
+    {
+        if (info != nullptr)
+        {
+            const uintptr_t base = g_guestFaultBase.load(std::memory_order_relaxed);
+            const size_t size = g_guestFaultSize.load(std::memory_order_relaxed);
+            const size_t pageSize = g_guestFaultPageSize.load(std::memory_order_relaxed);
+            const uintptr_t faultAddr = reinterpret_cast<uintptr_t>(info->si_addr);
+
+            // Commit any PROT_NONE page within [base + pageSize, base + size) on demand;
+            // keep page 0 [base, base + pageSize) as a true null-pointer guard.
+            if (base != 0 && faultAddr >= (base + pageSize) && faultAddr < (base + size))
+            {
+                const uintptr_t pageAligned = faultAddr & ~(pageSize - 1);
+                // Commit in 64 KiB chunks (bounded to guest end) to amortize sequential MMIO/buffer scans.
+                const size_t chunkBytes = std::min<size_t>(pageSize * 4, (base + size) - pageAligned);
+                if (mprotect(reinterpret_cast<void*>(pageAligned), chunkBytes, PROT_READ | PROT_WRITE) == 0)
+                    return;
+            }
+        }
+
+        ForwardUnhandledSignal(sig, info, ucontext, sig == SIGBUS ? g_prevSigbusAction : g_prevSigsegvAction);
+    }
 
     os::ios::MemoryBudget ComputeMemoryBudget()
     {
@@ -37,9 +95,10 @@ namespace
         if (physBytes <= (4ULL * GiB + 512ULL * MiB))
         {
             // 4 GB RAM iPhones (e.g., iPhone 11 / 12 / 13 / SE): Jetsam limit ~1.85 GiB
+            // Note: o1heap rounds fragment allocations up to powers of two; untouched pages cost 0 RSS.
             budget.tier = os::ios::DeviceMemoryTier::Low4GB;
-            budget.guestUserHeapBytes = 384ULL * MiB;
-            budget.guestPhysicalHeapBytes = 384ULL * MiB;
+            budget.guestUserHeapBytes = 512ULL * MiB;
+            budget.guestPhysicalHeapBytes = 512ULL * MiB;
             budget.texturePoolMaxBytes = 384ULL * MiB;
             budget.uploadChunkBytes = 4ULL * MiB;
             budget.maxRetainedUploadChunks = 2;
@@ -51,8 +110,8 @@ namespace
         {
             // 6 GB RAM iPhones (e.g., iPhone 12 Pro / 13 Pro / 14 / 15): Jetsam limit ~2.85 GiB
             budget.tier = os::ios::DeviceMemoryTier::Mid6GB;
-            budget.guestUserHeapBytes = 512ULL * MiB;
-            budget.guestPhysicalHeapBytes = 512ULL * MiB;
+            budget.guestUserHeapBytes = 640ULL * MiB;
+            budget.guestPhysicalHeapBytes = 640ULL * MiB;
             budget.texturePoolMaxBytes = 640ULL * MiB;
             budget.uploadChunkBytes = 8ULL * MiB;
             budget.maxRetainedUploadChunks = 2;
@@ -64,8 +123,8 @@ namespace
         {
             // 8 GB+ RAM iPhones / iPads (iPhone 15 Pro / 16+, M-series iPads)
             budget.tier = os::ios::DeviceMemoryTier::High8GBPlus;
-            budget.guestUserHeapBytes = 768ULL * MiB;
-            budget.guestPhysicalHeapBytes = 768ULL * MiB;
+            budget.guestUserHeapBytes = 1024ULL * MiB;
+            budget.guestPhysicalHeapBytes = 1024ULL * MiB;
             budget.texturePoolMaxBytes = 1024ULL * MiB;
             budget.uploadChunkBytes = 8ULL * MiB;
             budget.maxRetainedUploadChunks = 3;
@@ -190,4 +249,26 @@ bool os::ios::SupportsNativeBCTextures()
         }
     }();
     return s_supportsBC;
+}
+
+void os::ios::InstallGuestMemoryFaultHandler(uint8_t* guestBase, size_t guestSize, size_t pageSize)
+{
+    if (guestBase == nullptr || guestSize == 0)
+        return;
+
+    const size_t safePageSize = pageSize > 0 ? pageSize : 16384U;
+    g_guestFaultPageSize.store(safePageSize, std::memory_order_release);
+    g_guestFaultSize.store(guestSize, std::memory_order_release);
+    g_guestFaultBase.store(reinterpret_cast<uintptr_t>(guestBase), std::memory_order_release);
+
+    std::call_once(g_faultHandlerOnceFlag, []()
+    {
+        struct sigaction act{};
+        act.sa_sigaction = GuestMemorySignalHandler;
+        sigemptyset(&act.sa_mask);
+        act.sa_flags = SA_SIGINFO | SA_NODEFER;
+
+        sigaction(SIGBUS, &act, &g_prevSigbusAction);
+        sigaction(SIGSEGV, &act, &g_prevSigsegvAction);
+    });
 }
