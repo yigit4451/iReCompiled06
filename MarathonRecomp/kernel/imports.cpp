@@ -14,6 +14,7 @@
 #include "xdm.h"
 #include <user/config.h>
 #include <os/logger.h>
+#include <utils/watchdog.h>
 
 #ifdef _WIN32
 #include <ntstatus.h>
@@ -72,7 +73,26 @@ struct Event final : KernelObject, HostObject<XKEVENT>
         }
         else
         {
-            assert(false && "Unhandled timeout value.");
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+            while (true)
+            {
+                if (manualReset)
+                {
+                    if (signaled.load(std::memory_order_acquire))
+                        return STATUS_SUCCESS;
+                }
+                else
+                {
+                    bool expected = true;
+                    if (signaled.compare_exchange_strong(expected, false))
+                        return STATUS_SUCCESS;
+                }
+
+                if (std::chrono::steady_clock::now() >= deadline)
+                    return STATUS_TIMEOUT;
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
         }
 
         return STATUS_SUCCESS;
@@ -148,8 +168,18 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
         }
         else
         {
-            assert(false && "Unhandled timeout value.");
-            return STATUS_TIMEOUT;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+            while (true)
+            {
+                uint32_t currentCount = count.load();
+                if (currentCount != 0 && count.compare_exchange_weak(currentCount, currentCount - 1))
+                    return STATUS_SUCCESS;
+
+                if (std::chrono::steady_clock::now() >= deadline)
+                    return STATUS_TIMEOUT;
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
         }
     }
 
@@ -177,7 +207,30 @@ inline void CloseKernelObject(XDISPATCHER_HEADER& header)
 
 uint32_t GuestTimeoutToMilliseconds(be<int64_t>* timeout)
 {
-    return timeout ? (*timeout * -1) / 10000 : INFINITE;
+    if (!timeout)
+        return INFINITE;
+
+    const int64_t raw100ns = timeout->get();
+    if (raw100ns == 0)
+        return 0;
+
+    if (raw100ns < 0)
+    {
+        // Relative timeout in 100-nanosecond intervals.
+        const uint64_t abs100ns = (raw100ns == INT64_MIN) ? static_cast<uint64_t>(INT64_MAX) : static_cast<uint64_t>(-raw100ns);
+        const uint64_t ms = abs100ns / 10000ULL;
+        return ms >= INFINITE ? (INFINITE - 1) : static_cast<uint32_t>(ms);
+    }
+
+    // Positive NT timeout is an absolute FILETIME (100ns ticks since 1601-01-01).
+    constexpr int64_t FILETIME_EPOCH_DIFFERENCE = 116444736000000000LL;
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const int64_t now100ns = std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10000000>>>(now).count() + FILETIME_EPOCH_DIFFERENCE;
+    if (raw100ns <= now100ns)
+        return 0;
+
+    const uint64_t diffMs = static_cast<uint64_t>(raw100ns - now100ns) / 10000ULL;
+    return diffMs >= INFINITE ? (INFINITE - 1) : static_cast<uint32_t>(diffMs);
 }
 
 void VdHSIOCalibrationLock()
@@ -438,11 +491,17 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode, uint32_t Al
         return 0xFFFFFFFF;
 
     uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
-    // assert(timeout == 0 || timeout == INFINITE);
+    const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
 
     if (IsKernelObject(Handle))
     {
-        return GetKernelObject(Handle)->Wait(timeout);
+        if (timeout != 0)
+        {
+            Watchdog::ScopedWait waitGuard("NtWaitForSingleObjectEx", callerLr, Handle, timeout);
+            return GetKernelObject(Handle)->Wait(timeout);
+        }
+        Watchdog::Heartbeat(callerLr);
+        return GetKernelObject(Handle)->Wait(0);
     }
     else
     {
@@ -622,14 +681,22 @@ uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>* 
         return STATUS_USER_APC;
 
     uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+    const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
 
 #ifdef _WIN32
+    Watchdog::ScopedWait waitGuard("KeDelayExecutionThread", callerLr, 0, timeout);
     Sleep(timeout);
 #else
     if (timeout == 0)
+    {
+        Watchdog::Heartbeat(callerLr);
         std::this_thread::yield();
+    }
     else
+    {
+        Watchdog::ScopedWait waitGuard("KeDelayExecutionThread", callerLr, 0, timeout);
         std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+    }
 #endif
 
     return STATUS_SUCCESS;
@@ -768,6 +835,9 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
             return;
         }
 
+        const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+        const uint32_t csAddr = g_memory.IsInMemoryRange(cs) ? g_memory.MapVirtual(cs) : 0u;
+        Watchdog::ScopedWait waitGuard("RtlEnterCriticalSection", callerLr, csAddr, INFINITE);
         owningThread.wait(previousOwner);
     }
 }
@@ -1075,26 +1145,28 @@ bool KeResetEvent(XKEVENT* pEvent)
 
 uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, uint32_t WaitMode, bool Alertable, be<int64_t>* Timeout)
 {
+    if (Object == nullptr)
+        return STATUS_TIMEOUT;
+
     const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
-    assert(timeout == INFINITE);
+    const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    const uint32_t guestObjAddr = g_memory.IsInMemoryRange(Object) ? g_memory.MapVirtual(Object) : 0u;
+
+    Watchdog::ScopedWait waitGuard("KeWaitForSingleObject", callerLr, guestObjAddr, timeout);
 
     switch (Object->Type)
     {
         case 0:
         case 1:
-            QueryKernelObject<Event>(*Object)->Wait(timeout);
-            break;
+            return QueryKernelObject<Event>(*Object)->Wait(timeout);
 
         case 5:
-            QueryKernelObject<Semaphore>(*Object)->Wait(timeout);
-            break;
+            return QueryKernelObject<Semaphore>(*Object)->Wait(timeout);
 
         default:
             assert(false && "Unrecognized kernel object type.");
             return STATUS_TIMEOUT;
     }
-
-    return STATUS_SUCCESS;
 }
 
 static std::vector<size_t> g_tlsFreeIndices;
@@ -1448,6 +1520,8 @@ uint32_t NtResumeThread(GuestThreadHandle* hThread, uint32_t* suspendCount)
 uint32_t NtSetEvent(Event* handle, uint32_t* previousState)
 {
     handle->Set();
+    ++g_keSetEventGeneration;
+    g_keSetEventGeneration.notify_all();
     return 0;
 }
 
@@ -1472,9 +1546,50 @@ uint32_t NtReleaseSemaphore(Semaphore* Handle, uint32_t ReleaseCount, int32_t* P
     return STATUS_SUCCESS;
 }
 
-void NtWaitForMultipleObjectsEx()
+uint32_t NtWaitForMultipleObjectsEx(uint32_t Count, be<uint32_t>* Handles, uint32_t WaitType, uint32_t WaitMode, uint32_t Alertable, be<int64_t>* Timeout)
 {
-    LOG_UTILITY("!!! STUB !!!");
+    if (Count == 0 || Handles == nullptr)
+        return STATUS_SUCCESS;
+
+    const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+    const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    const uint32_t firstHandle = Handles[0].get();
+
+    Watchdog::ScopedWait waitGuard("NtWaitForMultipleObjectsEx", callerLr, firstHandle, timeout);
+
+    if (WaitType == 0) // WaitAll
+    {
+        for (uint32_t i = 0; i < Count; ++i)
+        {
+            const uint32_t h = Handles[i].get();
+            if (IsKernelObject(h))
+            {
+                const uint32_t res = GetKernelObject(h)->Wait(timeout);
+                if (res != STATUS_SUCCESS)
+                    return res;
+            }
+        }
+        return STATUS_SUCCESS;
+    }
+
+    const auto deadline = (timeout == INFINITE)
+        ? std::chrono::steady_clock::time_point::max()
+        : (std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout));
+
+    while (true)
+    {
+        for (uint32_t i = 0; i < Count; ++i)
+        {
+            const uint32_t h = Handles[i].get();
+            if (IsKernelObject(h) && GetKernelObject(h)->Wait(0) == STATUS_SUCCESS)
+                return STATUS_WAIT_0 + i;
+        }
+
+        if (timeout == 0 || (timeout != INFINITE && std::chrono::steady_clock::now() >= deadline))
+            return STATUS_TIMEOUT;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 void RtlCompareStringN()
@@ -1710,15 +1825,20 @@ void NetDll_XNetGetTitleXnAddr()
 
 uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* Objects, uint32_t WaitType, uint32_t WaitReason, uint32_t WaitMode, uint32_t Alertable, be<int64_t>* Timeout)
 {
-    // FIXME: This function is only accounting for events.
+    const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+    const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    const uint32_t firstObjAddr = (Count > 0 && Objects != nullptr) ? Objects[0].ptr.get() : 0u;
 
-    const uint64_t timeout = GuestTimeoutToMilliseconds(Timeout);
-    assert(timeout == INFINITE);
+    Watchdog::ScopedWait waitGuard("KeWaitForMultipleObjects", callerLr, firstObjAddr, timeout);
 
     if (WaitType == 0) // Wait all
     {
         for (size_t i = 0; i < Count; i++)
-            QueryKernelObject<Event>(*Objects[i])->Wait(timeout);
+        {
+            const uint32_t res = QueryKernelObject<Event>(*Objects[i])->Wait(timeout);
+            if (res != STATUS_SUCCESS)
+                return res;
+        }
     }
     else
     {
@@ -1728,6 +1848,20 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
         for (size_t i = 0; i < Count; i++)
             s_events[i] = QueryKernelObject<Event>(*Objects[i]);
 
+        if (timeout == 0)
+        {
+            for (size_t i = 0; i < Count; i++)
+            {
+                if (s_events[i]->Wait(0) == STATUS_SUCCESS)
+                    return STATUS_WAIT_0 + static_cast<uint32_t>(i);
+            }
+            return STATUS_TIMEOUT;
+        }
+
+        const auto deadline = (timeout == INFINITE)
+            ? std::chrono::steady_clock::time_point::max()
+            : (std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout));
+
         while (true)
         {
             uint32_t generation = g_keSetEventGeneration.load();
@@ -1735,12 +1869,19 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
             for (size_t i = 0; i < Count; i++)
             {
                 if (s_events[i]->Wait(0) == STATUS_SUCCESS)
-                {
-                    return STATUS_WAIT_0 + i;
-                }
+                    return STATUS_WAIT_0 + static_cast<uint32_t>(i);
             }
 
-            g_keSetEventGeneration.wait(generation);
+            if (timeout == INFINITE)
+            {
+                g_keSetEventGeneration.wait(generation);
+            }
+            else
+            {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    return STATUS_TIMEOUT;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
         }
     }
 

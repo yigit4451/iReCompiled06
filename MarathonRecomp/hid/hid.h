@@ -12,4 +12,6 @@ namespace HID
     bool GetCapabilities(uint32_t in_userIndex, XAMINPUT_CAPABILITIES* out_pCapabilities);
 
     bool IsInputAllowed();
+    void NotifyTouchSkipPressed();
+    void NotifyTouchSkipReleased();
 }

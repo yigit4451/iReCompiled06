@@ -2325,6 +2325,8 @@ namespace plume {
         this->layer = static_cast<CA::MetalLayer*>(desc.renderWindow.view);
         layer->setDevice(commandQueue->device->mtl);
         layer->setPixelFormat(mapPixelFormat(desc.format));
+        layer->setMaximumDrawableCount(MAX_DRAWABLES);
+        layer->setAllowsNextDrawableTimeout(true);
 
         this->commandQueue = commandQueue;
         this->desc = desc;
@@ -4181,7 +4183,10 @@ namespace plume {
     void MetalCommandQueue::waitForCommandFence(RenderCommandFence *fence) {
         MetalAutoreleasePool releasePool;
         const MetalCommandFence *metalFence = static_cast<MetalCommandFence *>(fence);
-        dispatch_semaphore_wait(metalFence->semaphore, DISPATCH_TIME_FOREVER);
+        const dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC);
+        if (dispatch_semaphore_wait(metalFence->semaphore, timeout) != 0) {
+            fprintf(stderr, "[plume_metal_ios] Warning: MetalCommandFence timed out after 3s (GPU command buffer stall/reset); continuing.\n");
+        }
     }
 
     // MetalPipelineLayout

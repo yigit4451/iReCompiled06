@@ -466,10 +466,12 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
             const auto& budget = os::ios::GetMemoryBudget();
             const uint64_t liveBytes = g_liveTextureBytes.load(std::memory_order_relaxed);
             const bool overSoftCap = liveBytes >= (budget.texturePoolMaxBytes * 3) / 4;
-            const bool largeOn4GB = (budget.tier == os::ios::DeviceMemoryTier::Low4GB) && (baseWidth >= 1024 || baseHeight >= 1024);
+            const bool largeOn4GB = (budget.tier == os::ios::DeviceMemoryTier::Low4GB) && (baseWidth >= 512 || baseHeight >= 512);
 
             if (largeOn4GB || overSoftCap || os::ios::IsJetsamPressureHigh())
-                startMip = 1;
+            {
+                startMip = (largeOn4GB && (baseWidth >= 2048 || baseHeight >= 2048) && safeNumMips > 2) ? 2u : 1u;
+            }
         }
 #else
         (void)allowMipClamp;
@@ -737,7 +739,7 @@ std::unique_ptr<GuestTexture> LoadTexture(const uint8_t* data, size_t dataSize, 
 static void DiffPatchTexture(GuestTexture& texture, uint8_t* data, uint32_t dataSize)
 {
 #ifdef MARATHON_RECOMP_IOS
-    if (os::ios::IsJetsamPressureHigh())
+    if (os::ios::GetMemoryBudget().tier == os::ios::DeviceMemoryTier::Low4GB || os::ios::IsJetsamPressureHigh())
         return;
 #endif
     static const std::unique_ptr<uint8_t[]> buttonBcDiff = decompressZstd(g_button_bc_diff, g_button_bc_diff_uncompressed_size);

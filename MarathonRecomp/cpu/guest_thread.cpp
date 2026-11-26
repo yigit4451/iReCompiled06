@@ -6,6 +6,7 @@
 #include <kernel/heap.h>
 #include <kernel/function.h>
 #include <os/logger.h>
+#include <utils/watchdog.h>
 #include "ppc_context.h"
 #include <mutex>
 #include <atomic>
@@ -181,8 +182,14 @@ static std::string GetGuestThreadName(const GuestThreadParams& params)
 static void GuestThreadFunc(void* data)
 {
     auto* hThread = static_cast<GuestThreadHandle*>(data);
-    hThread->suspended.wait(true);
+    const std::string threadName = GetGuestThreadName(hThread->params);
+    Watchdog::RegisterCurrentThread(Watchdog::ThreadKind::GuestWorker, threadName.c_str(), hThread->params.function);
+    {
+        Watchdog::ScopedWait waitGuard("GuestThread::InitialSuspend", hThread->params.function, 0, INFINITE);
+        hThread->suspended.wait(true);
+    }
     GuestThread::Start(hThread->params);
+    Watchdog::UnregisterCurrentThread();
     // HACK(1)
     hThread->isFinished = true;
 }

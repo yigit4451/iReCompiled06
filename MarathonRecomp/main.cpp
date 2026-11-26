@@ -31,6 +31,7 @@
 #include <preload_executable.h>
 #include <iostream>
 #include <app.h>
+#include <utils/watchdog.h>
 
 #ifdef _WIN32
 #include <timeapi.h>
@@ -427,7 +428,13 @@ extern "C" MARATHON_CORE_API int MarathonMain(int argc, char** argv)
     LOGN_WARNING("Start Guest Thread");
     LOGN_WARNING(modulePath.string());
 
+    Watchdog::Init();
+    Watchdog::RegisterCurrentThread(Watchdog::ThreadKind::GuestMain, "Guest Main (_xstart)", entry);
+
     GuestThread::Start({ entry, 0, 0 });
+
+    Watchdog::UnregisterCurrentThread();
+    Watchdog::Shutdown();
 
     if (GuestHasFatalError())
     {

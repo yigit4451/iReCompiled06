@@ -55,6 +55,8 @@ void XAudioInitializeSystem()
     CreateAudioDevice();
 }
 
+#include <utils/watchdog.h>
+
 static std::unique_ptr<HostThread> g_audioThread;
 static volatile bool g_audioThreadShouldExit;
 
@@ -62,23 +64,42 @@ static void AudioThread()
 {
     using namespace std::chrono_literals;
 
+    Watchdog::RegisterCurrentThread(Watchdog::ThreadKind::Audio, "Audio Thread", 0);
+
     GuestThreadContext ctx(0);
 
     size_t channels = g_downMixToStereo ? 2 : XAUDIO_NUM_CHANNELS;
 
     while (!g_audioThreadShouldExit)
     {
-        int queuedAudioSize = SDL_GetAudioStreamQueued(g_audioStream);
-        constexpr size_t MAX_LATENCY = 10;
+        Watchdog::Heartbeat(0);
+
         const size_t callbackAudioSize = channels * XAUDIO_NUM_SAMPLES * sizeof(float);
+        int queuedAudioSize = g_audioStream != nullptr ? SDL_GetAudioStreamQueued(g_audioStream) : -1;
 
         if (queuedAudioSize >= 0)
         {
-			for (size_t i = queuedAudioSize / callbackAudioSize; i <= MAX_LATENCY; i++)
-			{
-	            ctx.ppcContext.r3.u32 = g_clientCallbackParam;
-    	        g_clientCallback(ctx.ppcContext, g_memory.base);
-			}
+            SDL_ResumeAudioStreamDevice(g_audioStream);
+            constexpr size_t MAX_LATENCY = 10;
+            for (size_t i = queuedAudioSize / callbackAudioSize; i <= MAX_LATENCY; i++)
+            {
+                if (g_clientCallback != nullptr)
+                {
+                    ctx.ppcContext.r3.u32 = g_clientCallbackParam;
+                    g_clientCallback(ctx.ppcContext, g_memory.base);
+                }
+            }
+        }
+        else
+        {
+            // If iOS AudioSession/AudioQueue temporarily invalidates the stream (notification, route change,
+            // mute switch), still advance the guest XAudio callback once per 5.33 ms quantum so WMV/XMA
+            // audio-mastered movie playback never freezes waiting on voice buffer consumption.
+            if (g_clientCallback != nullptr)
+            {
+                ctx.ppcContext.r3.u32 = g_clientCallbackParam;
+                g_clientCallback(ctx.ppcContext, g_memory.base);
+            }
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -90,11 +111,14 @@ static void AudioThread()
         while (std::chrono::steady_clock::now() < next)
             std::this_thread::yield();
     }
+
+    Watchdog::UnregisterCurrentThread();
 }
 
 static void CreateAudioThread()
 {
-    SDL_ResumeAudioStreamDevice(g_audioStream);
+    if (g_audioStream != nullptr)
+        SDL_ResumeAudioStreamDevice(g_audioStream);
     g_audioThreadShouldExit = false;
     g_audioThread = std::make_unique<HostThread>("Audio Thread", AudioThread);
 }
@@ -163,7 +187,8 @@ void XAudioSubmitFrame(void* samples)
             audioFrames[i * 2 + 1] = isnan(samp1) ? 0.0f : samp1;
         }
 
-        SDL_PutAudioStreamData(g_audioStream, &audioFrames, sizeof(audioFrames));
+        if (g_audioStream != nullptr && SDL_GetAudioStreamQueued(g_audioStream) < 256 * 1024)
+            SDL_PutAudioStreamData(g_audioStream, &audioFrames, sizeof(audioFrames));
     }
     else
     {
@@ -173,12 +198,13 @@ void XAudioSubmitFrame(void* samples)
         {
             for (size_t j = 0; j < XAUDIO_NUM_CHANNELS; j++)
             {
-                float samp = floatSamples[j * XAUDIO_NUM_SAMPLES + i] * volume;
+                float samp = floatSamples[j * XAUDIO_NUM_CHANNELS + i] * volume;
                 audioFrames[i * XAUDIO_NUM_CHANNELS + j] = isnan(samp) ? 0.0f : samp;
             }
         }
 
-        SDL_PutAudioStreamData(g_audioStream, &audioFrames, sizeof(audioFrames));
+        if (g_audioStream != nullptr && SDL_GetAudioStreamQueued(g_audioStream) < 512 * 1024)
+            SDL_PutAudioStreamData(g_audioStream, &audioFrames, sizeof(audioFrames));
     }
 }
 

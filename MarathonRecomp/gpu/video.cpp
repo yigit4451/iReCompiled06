@@ -38,6 +38,7 @@
 #include <ui/options_menu.h>
 #include <user/config.h>
 #include <utils/host_thread.h>
+#include <utils/watchdog.h>
 #include <xxHashMap.h>
 
 #if defined(ASYNC_PSO_DEBUG) || defined(PSO_CACHING)
@@ -2431,7 +2432,7 @@ static void ProcRenderCommand(const RenderCommands::DrawImGui& args)
 
                 if (memcmp(&clipRect, &drawCmd.ClipRect, sizeof(clipRect)) != 0)
                 {
-                    commandList->setScissors(RenderRect(static_cast<int32_t>(drawCmd.ClipRect.x), static_cast<int32_t>(drawCmd.ClipRect.y), static_cast<int32_t>(drawCmd.ClipRect.z), static_cast<int32_t>(drawCmd.ClipRect.w)));
+                    commandList->setScissors(RenderRect(static_cast<int32_t>(drawCmd.Clip>(drawCmd.ClipRect.y), static_cast<int32_t>(drawCmd.ClipRect.z), static_cast<int32_t>(drawCmd.ClipRect.w)));
                     clipRect = drawCmd.ClipRect;
                 }
 
@@ -2455,6 +2456,8 @@ void Video::WaitOnSwapChain()
     {
         if (g_swapChainValid)
         {
+            const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+            Watchdog::ScopedWait waitGuard("Video::WaitOnSwapChain", callerLr, 0, 1000);
             g_presentWaitProfiler.Begin();
             g_swapChain->wait();
             g_presentWaitProfiler.End();
@@ -2579,6 +2582,20 @@ static xxHashMap<std::pair<RenderTargetType, Sonicteam::SoX::RefSharedPointer<So
 
 void Video::Present()
 {
+    const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    Watchdog::Heartbeat(callerLr);
+
+#ifdef MARATHON_RECOMP_IOS
+    // During standalone intro/WMV playback loops, DocMarathonState::Update may not run every frame;
+    // pump SDL events on the main thread right here so touch-to-skip (Start/A) and lifecycle events
+    // are processed with zero frame latency.
+    if (HostThread::GetCurrentID() == g_mainThreadId)
+    {
+        SDL_PumpEvents();
+        SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+    }
+#endif
+
     g_readyForCommands = false;
 
     g_renderQueue.enqueue(RenderCommands::ExecutePendingStretchRectCommands{});
@@ -2587,13 +2604,17 @@ void Video::Present()
 
     g_renderQueue.enqueue(RenderCommands::ExecuteCommandList{});
 
-    g_executedCommandList.wait(false);
+    {
+        Watchdog::ScopedWait waitGuard("Video::Present->ExecuteCommandList", callerLr, 0, INFINITE);
+        g_executedCommandList.wait(false);
+    }
     g_executedCommandList = false;
 
     if (g_swapChainValid)
     {
         if (g_pendingWaitOnSwapChain)
         {
+            Watchdog::ScopedWait waitGuard("Video::Present->SwapChainWait", callerLr, 0, 1000);
             g_presentWaitProfiler.Begin();
             g_swapChain->wait(); // Never gonna happen outside loading threads as explained above.
             g_presentWaitProfiler.End();
@@ -2610,6 +2631,7 @@ void Video::Present()
 
     if (g_commandListStates[g_frame])
     {
+        Watchdog::ScopedWait waitGuard("Video::Present->waitForCommandFence", callerLr, g_frame, 3000);
         g_frameFenceProfiler.Begin();
         g_queue->waitForCommandFence(g_commandFences[g_frame].get());
         g_frameFenceProfiler.End();
@@ -2628,7 +2650,9 @@ void Video::Present()
     g_quadIndexData.reset();
 
 #ifdef MARATHON_RECOMP_IOS
-    if (os::ios::ConsumeMemoryWarningFlag() || os::ios::IsJetsamPressureHigh())
+    const auto& iosBudget = os::ios::GetMemoryBudget();
+    const bool overTexturePoolCap = g_liveTextureBytes.load(std::memory_order_relaxed) > iosBudget.texturePoolMaxBytes;
+    if (os::ios::ConsumeMemoryWarningFlag() || os::ios::IsJetsamPressureHigh() || overTexturePoolCap)
     {
         Video::WaitForGPU();
         g_renderTargetCache.clear();
@@ -2806,10 +2830,7 @@ bool Video::Resize(uint32_t width, uint32_t height)
     pApp->m_pDepthTile4x = CreateSurface(internalSize.Width, internalSize.Height, D3DFMT_D24FS8, 2, reinterpret_cast<GuestSurfaceCreateParams*>(&surfaceParams));
 
     // Viewport is reset here because we're using the game's backbuffer directly.
-    SetRenderTarget(static_cast<GuestDevice*>(pApp->m_pDevice.get()), 0, static_cast<GuestSurface*>(pApp->m_pBackBufferSurface.get()));
-    SetDepthStencilSurface(static_cast<GuestDevice*>(pApp->m_pDevice.get()), static_cast<GuestSurface*>(pApp->m_pDepthStencilSurface.get()));
-
-    g_backBuffer = static_cast<GuestSurface*>(pApp->m_pBackBufferSurface.get());
+    SetRenderTarget(static_cast<GuestDevice*>(pApp->m_pDevice.get()), 0, static_cast<GuestSurface*>(pApp->m_pBackBufferSurfa_backBuffer = static_cast<GuestSurface*>(pApp->m_pBackBufferSurface.get());
     g_depthStencil = static_cast<GuestSurface*>(pApp->m_pDepthStencilSurface.get());
 
     g_backBuffer->format = BACKBUFFER_FORMAT;
@@ -3091,6 +3112,9 @@ static void ProcRenderCommand(const RenderCommands::ExecuteCommandList& cmd)
             {
                 RenderFramebufferDesc desc;
                 desc.colorAttachments = const_cast<const RenderTexture **>(&swapChainTexture);
+                   {
+                RenderFramebufferDesc desc;
+                desc.colorAttachments = const_cast<const RenderTexture **>(&swapChainTexture);
                 desc.colorAttachmentsCount = 1;
                 framebuffer = g_device->createFramebuffer(desc);
             }
@@ -3320,13 +3344,7 @@ static void ProcRenderCommand(const RenderCommands::StretchRect& args)
 
     // Erase previous pending command so it doesn't cause the texture to be overridden.
     if (args.texture->sourceSurface != nullptr)
-        args.texture->sourceSurface->destinationTextures.erase(args.texture);
-
-    args.texture->sourceSurface = surface;
-
-    surface->destinationTextures.emplace(args.texture, args.destSliceOrFace);
-
-    // If the texture is assigned to any slots, set it again. This'll also push the barrier.
+        args.texture->sourceSurface->destinationTextures.erture is assigned to any slots, set it again. This'll also push the barrier.
     for (uint32_t i = 0; i < std::size(g_textures); i++)
     {
         if (g_textures[i] == args.texture)
@@ -3711,6 +3729,10 @@ static void ProcRenderCommand(const RenderCommands::SetViewport& args)
     SetDirtyValue<float>(g_dirtyStates.viewport, g_viewport.height, args.height);
     SetDirtyValue<float>(g_dirtyStates.viewport, g_viewport.minDepth, args.minDepth);
     SetDirtyValue<float>(g_dirtyStates.viewport, g_viewport.maxDepth, args.maxDepth);
+
+    uint32_t specConstants = g_pipelineState.specConstants;
+    if (args.minDepth > args.maxDepth)
+        specConstants |=_viewport.maxDepth, args.maxDepth);
 
     uint32_t specConstants = g_pipelineState.specConstants;
     if (args.minDepth > args.maxDepth)
@@ -4115,9 +4137,7 @@ static void ProcRenderCommand(const RenderCommands::DrawIndexedPrimitive& args)
 static void ProcRenderCommand(const RenderCommands::DrawPrimitiveUP& args)
 {
     SetPrimitiveType(args.primitiveType);
-    SetDirtyValue(g_dirtyStates.pipelineState, g_pipelineState.vertexStrides[0], static_cast<uint8_t>(args.vertexStreamZeroStride));
-
-    auto allocation = g_uploadAllocators[g_frame].allocate<true>(reinterpret_cast<const uint32_t*>(args.vertexStreamZeroData), args.vertexStreamZeroSize, 0x4);
+    SetDirtyValue(g_dirtyStates.pipelineState, g_pipest<const uint32_t*>(args.vertexStreamZeroData), args.vertexStreamZeroSize, 0x4);
 
     auto& vertexBufferView = g_vertexBufferViews[0];
     vertexBufferView.size = args.primitiveCount * args.vertexStreamZeroStride;
@@ -4241,15 +4261,24 @@ static void ProcRenderCommand(const RenderCommands::SetClipPlane& args)
 static HostThread g_renderThread("Render Thread", []
     {
         HostThread::SetCurrentThreadPriority(HostThreadPriority::High);
+        Watchdog::RegisterCurrentThread(Watchdog::ThreadKind::Render, "Render Thread", 0);
 
         RenderCommand commands[32];
 
         while (true)
         {
-            size_t count = g_renderQueue.wait_dequeue_bulk(commands, std::size(commands));
+            size_t count = 0;
+            {
+                Watchdog::ScopedWait waitGuard("RenderQueue::wait_dequeue_bulk", 0, 0, INFINITE);
+                count = g_renderQueue.wait_dequeue_bulk(commands, std::size(commands));
+            }
+
+            Watchdog::Heartbeat(0);
 
             for (size_t i = 0; i < count; i++)
                 std::visit([](const auto& cmd) { ProcRenderCommand(cmd); }, commands[i]);
+
+            Watchdog::Heartbeat(0);
         }
     });
 
@@ -4293,5 +4322,8 @@ GUEST_FUNCTION_STUB(sub_8253EAE0);
 GUEST_FUNCTION_STUB(sub_8254D598); // BeginConditional
 GUEST_FUNCTION_STUB(sub_8254D7B0); // BeginConditional
 GUEST_FUNCTION_STUB(sub_8254D9D0); // BeginConditional
+GUEST_FUNCTION_STUB(sub_8254DB90); // BeginConditional
+GUEST_FUNCTION_STUB(sub_8254DD40); // SetScreenExtentQueryMode
+N_STUB(sub_8254D9D0); // BeginConditional
 GUEST_FUNCTION_STUB(sub_8254DB90); // BeginConditional
 GUEST_FUNCTION_STUB(sub_8254DD40); // SetScreenExtentQueryMode

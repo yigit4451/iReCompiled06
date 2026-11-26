@@ -242,6 +242,7 @@ set(MARATHON_RECOMP_UTILS_CXX_SOURCES
     "utils/host_thread.cpp"
     "utils/message_box.cpp"
     "utils/ring_buffer.cpp"
+    "utils/watchdog.cpp"
 )
 
 set(MARATHON_RECOMP_THIRDPARTY_SOURCES

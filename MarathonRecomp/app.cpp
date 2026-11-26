@@ -15,6 +15,7 @@
 #include <user/registry.h>
 #include <utils/host_thread.h>
 #include <utils/message_box.h>
+#include <utils/watchdog.h>
 #include <xxHashMap.h>
 
 extern uint32_t g_mainThreadId;
@@ -179,6 +180,7 @@ PPC_FUNC(sub_825EA610)
 
     App::s_deltaTime = ctx.f1.f64;
     App::s_time += App::s_deltaTime;
+    Watchdog::Heartbeat(static_cast<uint32_t>(ctx.lr));
     App::Update(App::s_deltaTime);
 
     __imp__sub_825EA610(ctx, base);

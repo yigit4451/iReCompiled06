@@ -49,6 +49,17 @@ namespace HID
                 g_manager.BroadcastMessage<MsgSetVibration>(XAMINPUT_VIBRATION{ 0, 0 });
                 break;
 
+#ifdef MARATHON_RECOMP_IOS
+            case SDL_EVENT_FINGER_DOWN:
+                NotifyTouchSkipPressed();
+                break;
+
+            case SDL_EVENT_FINGER_UP:
+            case SDL_EVENT_FINGER_CANCELED:
+                NotifyTouchSkipReleased();
+                break;
+#endif
+
             case SDL_EVENT_QUIT:
                 g_manager.BroadcastMessage<MsgSetLED>(0, 0, 0);
                 break;
