@@ -298,6 +298,7 @@ struct SetupWizardView: View {
 
     @State private var selectedDLCURLs: [URL] = []
     @State private var skipHashChecks = false
+    @State private var deleteLocalSourceAfterInstall = false
 
     @State private var availableDiskBytes: Int64 = 0
     @State private var manualVerifyFeedback: String?
@@ -623,6 +624,18 @@ struct SetupWizardView: View {
                 }
             }
             .tint(.cyan)
+
+            Toggle(isOn: $deleteLocalSourceAfterInstall) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Kurulum tamamlanınca yerel kaynak arşivi (.7z/.iso) sil")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white)
+                    Text("Kurulum %100 başarıyla bittiğinde, iOS dosya izni elveriyorsa seçtiğiniz yerel .7z veya .iso arşivini otomatik silerek hafızada yer açar.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .tint(.orange)
 
             manualVerificationSection
 
@@ -1255,6 +1268,7 @@ struct SetupWizardView: View {
             : "Güvenlik kapsamlı kaynak bağlanıyor (NSFileCoordinator)..."
 
         let shouldSkipHashes = skipHashChecks
+        let shouldDeleteLocalArchive = deleteLocalSourceAfterInstall
 
         DispatchQueue.global(qos: .userInitiated).async {
             defer {
@@ -1280,6 +1294,7 @@ struct SetupWizardView: View {
             let totalItems = max(allItems.count, 1)
             var overallSuccess = true
             var failureReason = ""
+            var didDeleteLocalSourceArchive = false
 
             for (index, item) in allItems.enumerated() {
                 let itemBaseProgress = Double(index) / Double(totalItems)
@@ -1376,6 +1391,33 @@ struct SetupWizardView: View {
                     failureReason = itemErrorText
                     break
                 }
+
+                // If this was the primary local archive (.7z or .iso), installation succeeded, and the user opted
+                // to delete their local source archive after install, attempt coordinated deletion while security scope is active.
+                if index == 0,
+                   !isTemporaryFile,
+                   shouldDeleteLocalArchive,
+                   IsMarathonInstalled() {
+                    let ext = item.url.pathExtension.lowercased()
+                    if ext == "7z" || ext == "iso" {
+                        var delCoordErr: NSError?
+                        let delCoordinator = NSFileCoordinator(filePresenter: nil)
+                        delCoordinator.coordinate(
+                            writingItemAt: item.url,
+                            options: [.forDeleting],
+                            error: &delCoordErr
+                        ) { writableURL in
+                            if (try? FileManager.default.removeItem(at: writableURL)) != nil {
+                                didDeleteLocalSourceArchive = true
+                            }
+                        }
+                        if !didDeleteLocalSourceArchive {
+                            if (try? FileManager.default.removeItem(at: item.url)) != nil {
+                                didDeleteLocalSourceArchive = true
+                            }
+                        }
+                    }
+                }
             }
 
             DispatchQueue.main.async {
@@ -1384,9 +1426,14 @@ struct SetupWizardView: View {
                 if overallSuccess && IsMarathonInstalled() {
                     self.progressValue = 1.0
                     self.extractionFinished = true
-                    self.statusMessage = isTemporaryFile
-                        ? "Documents/iReCompiled06 kurulumu tamamlandı ve geçici ISO dosyası silindi!"
-                        : "Documents/iReCompiled06 dizinine kurulum tamamlandı!"
+                    if didDeleteLocalSourceArchive {
+                        self.selectedSourceURL = nil
+                        self.statusMessage = "Documents/iReCompiled06 kurulumu tamamlandı ve kaynak arşiv (.7z/.iso) silindi!"
+                    } else if isTemporaryFile {
+                        self.statusMessage = "Documents/iReCompiled06 kurulumu tamamlandı ve geçici ISO/.7z dosyaları silindi!"
+                    } else {
+                        self.statusMessage = "Documents/iReCompiled06 dizinine kurulum tamamlandı!"
+                    }
                 } else {
                     self.errorMessage = failureReason.isEmpty
                         ? "Kurulum tamamlanamadı veya eksik oyun dosyaları tespit edildi."

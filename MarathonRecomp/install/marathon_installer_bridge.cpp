@@ -72,22 +72,52 @@ namespace
         return baseTmpDir;
     }
 
-    void PurgeStaleTemporaryExtractionArtifacts()
+    bool IsPathInsideAppTempOrCaches(const std::filesystem::path& candidatePath)
+    {
+        std::error_code ec;
+        const std::string candidateStr = LowerAscii(candidatePath.lexically_normal().string());
+        const std::string baseTmpStr = LowerAscii(GetBaseTempDirectory().lexically_normal().string());
+        if (!baseTmpStr.empty() && candidateStr.rfind(baseTmpStr, 0) == 0)
+            return true;
+
+        if (candidateStr.find("/tmp/") != std::string::npos ||
+            candidateStr.find("/library/caches/") != std::string::npos ||
+            candidateStr.find("/documents/inbox/") != std::string::npos)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    void PurgeStaleTemporaryExtractionArtifacts(const std::filesystem::path& activeInputPath = {})
     {
         std::error_code ec;
         const std::filesystem::path baseTmpDir = GetBaseTempDirectory();
         if (!std::filesystem::exists(baseTmpDir, ec))
             return;
 
-        std::filesystem::remove(baseTmpDir / "extracted_game.iso", ec);
+        const std::filesystem::path normalizedActive = activeInputPath.empty()
+            ? std::filesystem::path{}
+            : activeInputPath.lexically_normal();
+
+        if (normalizedActive != (baseTmpDir / "extracted_game.iso").lexically_normal())
+        {
+            std::filesystem::remove(baseTmpDir / "extracted_game.iso", ec);
+        }
 
         std::vector<std::filesystem::path> staleTargets;
         for (std::filesystem::directory_iterator it(baseTmpDir, ec), end; it != end && !ec; it.increment(ec))
         {
-            const std::string name = it->path().filename().string();
-            if (name.rfind("iReCompiled06_7z_", 0) == 0)
+            const std::filesystem::path entryPath = it->path();
+            if (!normalizedActive.empty() && entryPath.lexically_normal() == normalizedActive)
+                continue;
+
+            const std::string name = entryPath.filename().string();
+            if (name.rfind("iReCompiled06_7z_", 0) == 0 ||
+                name.rfind("iReCompiled06-", 0) == 0 ||
+                name.rfind("CFNetworkDownload_", 0) == 0)
             {
-                staleTargets.push_back(it->path());
+                staleTargets.push_back(entryPath);
             }
         }
 
@@ -122,7 +152,7 @@ namespace
                 paths.push_back(p);
         }
 
-        ~ScopedTempCleanup()
+        void purgeNow()
         {
             std::error_code ec;
             for (const auto& p : paths)
@@ -130,6 +160,12 @@ namespace
                 if (!p.empty())
                     std::filesystem::remove_all(p, ec);
             }
+            paths.clear();
+        }
+
+        ~ScopedTempCleanup()
+        {
+            purgeNow();
         }
     };
 
@@ -786,14 +822,17 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
 #ifdef MARATHON_RECOMP_IOS
         os::ios::EnsureSandboxDirectories();
 #endif
-        // Purge any leftover tmp/iReCompiled06_7z_* directories or tmp/extracted_game.iso from earlier runs
-        PurgeStaleTemporaryExtractionArtifacts();
+        std::filesystem::path inputPath = std::filesystem::u8path(sourcePath);
+        const std::filesystem::path originalInputPath = inputPath;
+
+        // Purge any leftover tmp/iReCompiled06_7z_* directories, tmp/extracted_game.iso, or stale downloads
+        // from earlier runs while preserving the active inputPath if it came from URL download in tmp/.
+        PurgeStaleTemporaryExtractionArtifacts(originalInputPath);
 
         const std::filesystem::path installRoot = GetInstallRoot();
         std::error_code ec;
         std::filesystem::create_directories(installRoot, ec);
 
-        std::filesystem::path inputPath = std::filesystem::u8path(sourcePath);
         if (!std::filesystem::exists(inputPath, ec))
         {
             const int savedErr = errno;
@@ -812,6 +851,11 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
         }
 
         ScopedTempCleanup temp7zCleanup{};
+        if (IsPathInsideAppTempOrCaches(originalInputPath))
+        {
+            temp7zCleanup.add(originalInputPath);
+        }
+
         float baseProgressOffset = 0.0f;
         float progressScale = 1.0f;
 
@@ -824,6 +868,13 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
             {
                 WriteStringToBuffer(archiveErr.empty() ? ".7z arşivi geçici dizine çıkartılamadı." : archiveErr, errorBuffer, errorBufferSize);
                 return false;
+            }
+            // If the .7z archive itself was stored in app temporary/cache storage (e.g. URL download or inbox copy),
+            // delete it immediately now that tmp/extracted_game.iso has been unpacked so disk usage doesn't stack.
+            if (IsPathInsideAppTempOrCaches(originalInputPath))
+            {
+                std::error_code rmEc;
+                std::filesystem::remove(originalInputPath, rmEc);
             }
             inputPath = resolvedPayload;
             baseProgressOffset = 0.48f;
@@ -872,6 +923,7 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
                 const bool ok = ExtractStandaloneXex(inputPath, installRoot, progressCallback, userData, xexError);
                 if (!ok)
                     WriteStringToBuffer(xexError, errorBuffer, errorBufferSize);
+                temp7zCleanup.purgeNow();
                 return ok;
             }
         }
@@ -933,7 +985,9 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
 
         if (!Installer::install(sources, installRoot, skipHashChecks, journal, std::chrono::seconds(0), bridgeProgress))
         {
+            sources = Installer::Sources{};
             Installer::rollback(journal);
+            temp7zCleanup.purgeNow();
             const std::string msg = journal.lastErrorMessage.empty()
                 ? "Kurulum sırasında hata oluştu ve kısmi dosyalar geri alındı."
                 : journal.lastErrorMessage;
@@ -941,8 +995,12 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
             return false;
         }
 
+        // Release VFS file descriptors and immediately remove temporary extracted_game.iso / .7z cache before firing 100% callback
+        sources = Installer::Sources{};
+        temp7zCleanup.purgeNow();
+
         if (progressCallback)
-            progressCallback(1.0f, journal.progressTotal, journal.progressTotal, "Kurulum başarıyla tamamlandı!", userData);
+            progressCallback(1.0f, journal.progressTotal, journal.progressTotal, "Kurulum tamamlandı ve geçici arşiv dosyaları temizlendi!", userData);
 
         return true;
     }
