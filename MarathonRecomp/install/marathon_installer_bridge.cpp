@@ -17,6 +17,11 @@
 #include <os/ios/sandbox_ios.h>
 #endif
 
+#if defined(MARATHON_HAS_LIBARCHIVE)
+#include <archive.h>
+#include <archive_entry.h>
+#endif
+
 namespace
 {
     std::atomic<bool> s_cancelExtraction{ false };
@@ -59,6 +64,278 @@ namespace
     {
         return LowerAscii(path.extension().string()) == ".iso";
     }
+
+    bool Is7zExtension(const std::filesystem::path& path)
+    {
+        return LowerAscii(path.extension().string()) == ".7z";
+    }
+
+    struct ScopedTempDirectoryCleanup
+    {
+        std::filesystem::path path;
+
+        ~ScopedTempDirectoryCleanup()
+        {
+            if (!path.empty())
+            {
+                std::error_code ec;
+                std::filesystem::remove_all(path, ec);
+            }
+        }
+    };
+
+#if defined(MARATHON_HAS_LIBARCHIVE)
+    std::filesystem::path SanitizeArchiveEntryPath(const char* rawEntryPath)
+    {
+        if (rawEntryPath == nullptr || rawEntryPath[0] == '\0')
+            return {};
+
+        const std::filesystem::path raw = std::filesystem::u8path(rawEntryPath);
+        std::filesystem::path clean;
+        for (const auto& part : raw)
+        {
+            if (part == "." || part == "/" || part == "\\")
+                continue;
+            if (part == "..")
+                continue;
+            clean /= part;
+        }
+        return clean;
+    }
+
+    bool LocateExtractedPayloadInDirectory(
+        const std::filesystem::path& rootDir,
+        std::filesystem::path& outPayloadPath,
+        std::string& outError)
+    {
+        std::error_code ec;
+        std::filesystem::path foundIso;
+        std::filesystem::path foundXexDir;
+        std::filesystem::path foundStandaloneXex;
+
+        for (std::filesystem::recursive_directory_iterator it(rootDir, ec), end; it != end && !ec; it.increment(ec))
+        {
+            if (!it->is_regular_file(ec))
+                continue;
+
+            const std::filesystem::path filePath = it->path();
+            if (IsIsoExtension(filePath))
+            {
+                foundIso = filePath;
+                break;
+            }
+
+            if (LowerAscii(filePath.filename().string()) == "default.xex" || IsXexExtension(filePath))
+            {
+                const std::filesystem::path parentDir = filePath.parent_path();
+                if (!parentDir.empty() && std::filesystem::exists(parentDir / "xenon", ec))
+                {
+                    foundXexDir = parentDir;
+                }
+                else if (foundStandaloneXex.empty())
+                {
+                    foundStandaloneXex = filePath;
+                }
+            }
+        }
+
+        if (!foundIso.empty())
+        {
+            outPayloadPath = foundIso;
+            return true;
+        }
+
+        if (!foundXexDir.empty())
+        {
+            outPayloadPath = foundXexDir;
+            return true;
+        }
+
+        if (!foundStandaloneXex.empty())
+        {
+            outPayloadPath = foundStandaloneXex;
+            return true;
+        }
+
+        outError = ".7z arşivi içinde geçerli bir .iso kalıbı veya default.xex oyun dosyası bulunamadı.";
+        return false;
+    }
+
+    bool Extract7zArchiveToTemp(
+        const std::filesystem::path& archivePath,
+        std::filesystem::path& outTempDir,
+        std::filesystem::path& outResolvedPayloadPath,
+        MarathonExtractionProgressCallback progressCallback,
+        void* userData,
+        std::string& outError)
+    {
+        std::error_code ec;
+        std::filesystem::path baseTmpDir = std::filesystem::temp_directory_path(ec);
+        if (ec || baseTmpDir.empty())
+        {
+            baseTmpDir = GetInstallRoot().parent_path() / "tmp";
+        }
+
+        const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        outTempDir = baseTmpDir / ("iReCompiled06_7z_" + std::to_string(stamp));
+        std::filesystem::create_directories(outTempDir, ec);
+        if (ec)
+        {
+            outError = "Geçici .7z çıkartma dizini (tmp/) oluşturulamadı.";
+            return false;
+        }
+
+        const uint64_t compressedTotalBytes = std::filesystem::file_size(archivePath, ec);
+
+        struct archive* a = archive_read_new();
+        if (a == nullptr)
+        {
+            outError = "libarchive okuyucusu başlatılamadı.";
+            return false;
+        }
+
+        archive_read_support_format_7zip(a);
+        archive_read_support_format_all(a);
+        archive_read_support_filter_all(a);
+
+        const std::string archivePathStr = archivePath.string();
+        if (archive_read_open_filename(a, archivePathStr.c_str(), 1024 * 256) != ARCHIVE_OK)
+        {
+            const char* errStr = archive_error_string(a);
+            outError = std::string(".7z arşivi açılamadı: ") + (errStr ? errStr : "Bilinmeyen libarchive hatası.");
+            archive_read_free(a);
+            return false;
+        }
+
+        uint64_t totalUnpackedBytes = 0;
+        struct archive_entry* entry = nullptr;
+
+        while (true)
+        {
+            if (s_cancelExtraction.load(std::memory_order_relaxed))
+            {
+                archive_read_close(a);
+                archive_read_free(a);
+                outError = "Kurulum kullanıcı tarafından iptal edildi.";
+                return false;
+            }
+
+            const int r = archive_read_next_header(a, &entry);
+            if (r == ARCHIVE_EOF)
+                break;
+
+            if (r < ARCHIVE_OK && r != ARCHIVE_WARN)
+            {
+                const char* errStr = archive_error_string(a);
+                outError = std::string(".7z başlığı okunurken hata oluştu: ") + (errStr ? errStr : "Arşiv bozuk.");
+                archive_read_close(a);
+                archive_read_free(a);
+                return false;
+            }
+
+            const std::filesystem::path relPath = SanitizeArchiveEntryPath(archive_entry_pathname(entry));
+            if (relPath.empty())
+            {
+                archive_read_data_skip(a);
+                continue;
+            }
+
+            const std::filesystem::path dstPath = outTempDir / relPath;
+            const mode_t fileType = archive_entry_filetype(entry);
+            if (fileType == AE_IFDIR)
+            {
+                std::filesystem::create_directories(dstPath, ec);
+                continue;
+            }
+
+            if (fileType != AE_IFREG)
+            {
+                archive_read_data_skip(a);
+                continue;
+            }
+
+            std::filesystem::create_directories(dstPath.parent_path(), ec);
+            std::ofstream outFile(dstPath, std::ios::binary | std::ios::trunc);
+            if (!outFile.is_open())
+            {
+                outError = "Geçici dizine dosya yazılamadı: " + relPath.filename().string();
+                archive_read_close(a);
+                archive_read_free(a);
+                return false;
+            }
+
+            const void* chunkBuff = nullptr;
+            size_t chunkSize = 0;
+            la_int64_t chunkOffset = 0;
+            const std::string entryFilename = relPath.filename().string();
+
+            while (true)
+            {
+                if (s_cancelExtraction.load(std::memory_order_relaxed))
+                {
+                    outFile.close();
+                    archive_read_close(a);
+                    archive_read_free(a);
+                    outError = "Kurulum kullanıcı tarafından iptal edildi.";
+                    return false;
+                }
+
+                const int dr = archive_read_data_block(a, &chunkBuff, &chunkSize, &chunkOffset);
+                if (dr == ARCHIVE_EOF)
+                    break;
+
+                if (dr < ARCHIVE_OK && dr != ARCHIVE_WARN)
+                {
+                    const char* errStr = archive_error_string(a);
+                    outFile.close();
+                    archive_read_close(a);
+                    archive_read_free(a);
+                    outError = std::string(".7z veri akışı çözülürken hata: ") + (errStr ? errStr : "LZMA akış hatası.");
+                    return false;
+                }
+
+                if (chunkBuff != nullptr && chunkSize > 0)
+                {
+                    outFile.write(static_cast<const char*>(chunkBuff), static_cast<std::streamsize>(chunkSize));
+                    if (!outFile.good())
+                    {
+                        outFile.close();
+                        archive_read_close(a);
+                        archive_read_free(a);
+                        outError = "Geçici diske yazma hatası (cihazda yeterli boş alan olduğundan emin olun).";
+                        return false;
+                    }
+                    totalUnpackedBytes += chunkSize;
+                }
+
+                if (progressCallback)
+                {
+                    const uint64_t compPos = static_cast<uint64_t>(std::max<la_int64_t>(0, archive_filter_bytes(a, -1)));
+                    float archiveRatio = 0.20f;
+                    if (compressedTotalBytes > 0 && compPos > 0)
+                    {
+                        const double frac = std::clamp(static_cast<double>(compPos) / static_cast<double>(compressedTotalBytes), 0.0, 1.0);
+                        archiveRatio = static_cast<float>(0.02 + frac * 0.46);
+                    }
+                    const std::string msg = ".7z arşivi geçici dizine açılıyor: " + entryFilename;
+                    if (!progressCallback(archiveRatio, totalUnpackedBytes, compressedTotalBytes, msg.c_str(), userData))
+                    {
+                        outFile.close();
+                        archive_read_close(a);
+                        archive_read_free(a);
+                        outError = "Kurulum kullanıcı tarafından iptal edildi.";
+                        return false;
+                    }
+                }
+            }
+        }
+
+        archive_read_close(a);
+        archive_read_free(a);
+
+        return LocateExtractedPayloadInDirectory(outTempDir, outResolvedPayloadPath, outError);
+    }
+#endif
 
     bool ExtractStandaloneXex(
         const std::filesystem::path& xexPath,
@@ -300,6 +577,18 @@ extern "C" MARATHON_CORE_API MarathonSourceKind ValidateMarathonSource(
             return MARATHON_SOURCE_INVALID;
         }
 
+        if (Is7zExtension(path))
+        {
+            const uint64_t archiveSize = std::filesystem::file_size(path, ec);
+            if (ec || archiveSize < 32)
+            {
+                WriteStringToBuffer("Seçilen .7z arşivi boş veya okunamıyor.", detailBuffer, detailBufferSize);
+                return MARATHON_SOURCE_INVALID;
+            }
+            WriteStringToBuffer("7-Zip (.7z) arşivi doğrulandı (geçici dizine akış halinde açılıp kurulacak).", detailBuffer, detailBufferSize);
+            return MARATHON_SOURCE_7Z_ARCHIVE;
+        }
+
         if (IsIsoExtension(path))
         {
             if (Installer::parseGame(path))
@@ -330,7 +619,7 @@ extern "C" MARATHON_CORE_API MarathonSourceKind ValidateMarathonSource(
             return MARATHON_SOURCE_DLC;
         }
 
-        WriteStringToBuffer("Desteklenmeyen dosya biçimi. Lütfen geçerli bir .iso, default.xex veya oyun klasörü seçin.", detailBuffer, detailBufferSize);
+        WriteStringToBuffer("Desteklenmeyen dosya biçimi. Lütfen geçerli bir .iso, .7z, default.xex veya oyun klasörü seçin.", detailBuffer, detailBufferSize);
         return MARATHON_SOURCE_INVALID;
     }
     catch (const std::exception& e)
@@ -366,7 +655,7 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
         std::error_code ec;
         std::filesystem::create_directories(installRoot, ec);
 
-        const std::filesystem::path inputPath = std::filesystem::u8path(sourcePath);
+        std::filesystem::path inputPath = std::filesystem::u8path(sourcePath);
         if (!std::filesystem::exists(inputPath, ec))
         {
             WriteStringToBuffer("Kaynak dosyaya erişilemedi. Bulut dosyasının çevrimiçi olduğundan emin olun.", errorBuffer, errorBufferSize);
@@ -377,6 +666,29 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
         {
             WriteStringToBuffer("Kurulum kullanıcı tarafından iptal edildi.", errorBuffer, errorBufferSize);
             return false;
+        }
+
+        ScopedTempDirectoryCleanup temp7zCleanup{};
+        float baseProgressOffset = 0.0f;
+        float progressScale = 1.0f;
+
+        if (Is7zExtension(inputPath))
+        {
+#if defined(MARATHON_HAS_LIBARCHIVE)
+            std::filesystem::path resolvedPayload;
+            std::string archiveErr;
+            if (!Extract7zArchiveToTemp(inputPath, temp7zCleanup.path, resolvedPayload, progressCallback, userData, archiveErr))
+            {
+                WriteStringToBuffer(archiveErr.empty() ? ".7z arşivi geçici dizine çıkartılamadı." : archiveErr, errorBuffer, errorBufferSize);
+                return false;
+            }
+            inputPath = resolvedPayload;
+            baseProgressOffset = 0.48f;
+            progressScale = 0.52f;
+#else
+            WriteStringToBuffer("Bu derlemede libarchive (.7z) desteği etkin değil.", errorBuffer, errorBufferSize);
+            return false;
+#endif
         }
 
         Installer::Input installerInput{};
@@ -406,7 +718,7 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
         }
         else
         {
-            WriteStringToBuffer("Seçilen dosya geçerli bir Sonic '06 ISO, XEX veya DLC kaynağı değil.", errorBuffer, errorBufferSize);
+            WriteStringToBuffer("Seçilen dosya geçerli bir Sonic '06 ISO, .7z, XEX veya DLC kaynağı değil.", errorBuffer, errorBufferSize);
             return false;
         }
 
@@ -421,7 +733,7 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
             return false;
         }
 
-        if (progressCallback && !progressCallback(0.02f, 0, journal.progressTotal, "Dosyalar kopyalanmadan doğrudan Documents/iReCompiled06 dizinine çıkartılıyor...", userData))
+        if (progressCallback && !progressCallback(baseProgressOffset + 0.02f * progressScale, 0, journal.progressTotal, "Dosyalar Documents/iReCompiled06 dizinine çıkartılıyor...", userData))
         {
             WriteStringToBuffer("Kurulum kullanıcı tarafından iptal edildi.", errorBuffer, errorBufferSize);
             return false;
@@ -443,6 +755,7 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
                 const double raw = static_cast<double>(done) / static_cast<double>(total);
                 ratio = static_cast<float>(std::clamp(raw, 0.02, 0.99));
             }
+            const float scaledRatio = std::clamp(baseProgressOffset + ratio * progressScale, 0.02f, 0.99f);
 
             std::string status = "Oyun arşivleri çıkartılıyor...";
             if (!journal.createdFiles.empty())
@@ -452,7 +765,7 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
                     status = "Çıkartılıyor: " + lastFile;
             }
 
-            return progressCallback(ratio, done, total, status.c_str(), userData);
+            return progressCallback(scaledRatio, done, total, status.c_str(), userData);
         };
 
         if (!Installer::install(sources, installRoot, skipHashChecks, journal, std::chrono::seconds(0), bridgeProgress))

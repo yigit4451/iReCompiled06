@@ -443,7 +443,10 @@ if (MARATHON_RECOMP_FLATPAK)
     )
 endif()
 
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    find_package(LibArchive REQUIRED)
+    target_compile_definitions(${MARATHON_TARGET_NAME} PRIVATE MARATHON_HAS_LIBARCHIVE=1)
+else()
     find_package(CURL REQUIRED)
 endif()
 
@@ -498,7 +501,11 @@ target_link_libraries(${MARATHON_TARGET_NAME} PRIVATE
     plume
 )
 
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    target_link_libraries(${MARATHON_TARGET_NAME} PUBLIC
+        LibArchive::LibArchive
+    )
+else()
     target_link_libraries(${MARATHON_TARGET_NAME} PRIVATE
         CURL::libcurl
         nfd::nfd

@@ -210,7 +210,7 @@ private final class RemoteArchiveDownloader: NSObject, URLSessionDownloadDelegat
     private static func inferExtension(from suggestedFilename: String? = nil, url: URL?, fallback: String) -> String {
         if let suggestedFilename {
             let ext = (suggestedFilename as NSString).pathExtension.lowercased()
-            if ext == "iso" || ext == "xex" {
+            if ext == "iso" || ext == "xex" || ext == "7z" {
                 return ext
             }
         }
@@ -222,10 +222,13 @@ private final class RemoteArchiveDownloader: NSObject, URLSessionDownloadDelegat
 
     private static func inferExtension(from url: URL, fallback: String) -> String {
         let pathExt = url.pathExtension.lowercased()
-        if pathExt == "iso" || pathExt == "xex" {
+        if pathExt == "iso" || pathExt == "xex" || pathExt == "7z" {
             return pathExt
         }
         let lowerQuery = (url.query ?? "").lowercased()
+        if lowerQuery.contains(".7z") {
+            return "7z"
+        }
         if lowerQuery.contains(".xex") {
             return "xex"
         }
@@ -334,6 +337,9 @@ struct SetupWizardView: View {
             var types: [UTType] = []
             if let isoType = UTType(filenameExtension: "iso") {
                 types.append(isoType)
+            }
+            if let sevenZipType = UTType(filenameExtension: "7z") {
+                types.append(sevenZipType)
             }
             if let xexType = UTType(filenameExtension: "xex") {
                 types.append(xexType)
@@ -543,7 +549,7 @@ struct SetupWizardView: View {
                 lowStorageWarningBanner
             }
 
-            // 3 Primary Source Options: (1) ISO/XEX File, (2) Extracted Folder, (3) URL / Network Download
+            // 3 Primary Source Options: (1) ISO/.7z/XEX File, (2) Extracted Folder, (3) URL / Network Download
             HStack(spacing: 10) {
                 Button {
                     sourceMode = .localOrCloudFile
@@ -551,7 +557,7 @@ struct SetupWizardView: View {
                     activePickerMode = .file
                     isImporterPresented = true
                 } label: {
-                    Label("ISO / XEX Seç", systemImage: "doc.zipper")
+                    Label("ISO / .7z / XEX Seç", systemImage: "doc.zipper")
                         .font(.footnote.weight(.semibold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 5)

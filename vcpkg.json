@@ -13,6 +13,16 @@
         {
             "name": "curl",
             "platform": "!ios"
+        },
+        {
+            "name": "libarchive",
+            "default-features": false,
+            "features": [
+                "lzma",
+                "bzip2",
+                "lz4"
+            ],
+            "platform": "ios"
         }
     ],
     "vcpkg-configuration": {
