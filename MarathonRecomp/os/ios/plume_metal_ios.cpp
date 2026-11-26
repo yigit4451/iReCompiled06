@@ -1291,7 +1291,7 @@ namespace plume {
         this->pool = pool;
 
         RenderTextureDesc safeDesc = inDesc;
-        const uint32_t maxTexDim = std::max(1u, device->capabilities.maxTextureSize > 0 ? device->capabilities.maxTextureSize : 16384u);
+        const uint32_t maxTexDim = std::max<uint32_t>(1u, device->capabilities.maxTextureSize > 0 ? static_cast<uint32_t>(device->capabilities.maxTextureSize) : 16384u);
         safeDesc.width = std::clamp(inDesc.width, 1u, maxTexDim);
         safeDesc.height = std::clamp(inDesc.height, 1u, maxTexDim);
         safeDesc.depth = (inDesc.dimension == RenderTextureDimension::TEXTURE_3D)
