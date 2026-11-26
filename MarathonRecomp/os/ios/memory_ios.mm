@@ -3,6 +3,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
 #import <UIKit/UIKit.h>
 #include <algorithm>
 #include <atomic>
@@ -271,4 +272,17 @@ void os::ios::InstallGuestMemoryFaultHandler(uint8_t* guestBase, size_t guestSiz
         sigaction(SIGBUS, &act, &g_prevSigbusAction);
         sigaction(SIGSEGV, &act, &g_prevSigsegvAction);
     });
+}
+
+void os::ios::ConfigureMetalLayer(void* metalLayer)
+{
+    if (metalLayer == nullptr)
+        return;
+
+    @autoreleasepool
+    {
+        CAMetalLayer* caLayer = (__bridge CAMetalLayer*)metalLayer;
+        caLayer.maximumDrawableCount = 3;
+        caLayer.allowsNextDrawableTimeout = YES;
+    }
 }

@@ -2325,8 +2325,6 @@ namespace plume {
         this->layer = static_cast<CA::MetalLayer*>(desc.renderWindow.view);
         layer->setDevice(commandQueue->device->mtl);
         layer->setPixelFormat(mapPixelFormat(desc.format));
-        NS::Object::sendMessage<void>(layer, sel_registerName("setMaximumDrawableCount:"), static_cast<NS::UInteger>(MAX_DRAWABLES));
-        NS::Object::sendMessage<void>(layer, sel_registerName("setAllowsNextDrawableTimeout:"), true);
 
         this->commandQueue = commandQueue;
         this->desc = desc;

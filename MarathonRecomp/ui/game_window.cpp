@@ -17,6 +17,9 @@
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #include <res/images/game_icon_mac.png.h>
+#if TARGET_OS_IOS
+#include <os/ios/memory_ios.h>
+#endif
 #else
 #include <res/images/game_icon.bmp.h>
 #endif
@@ -293,6 +296,9 @@ void GameWindow::Init(const char* sdlVideoDriver)
     s_renderWindow.window = SDL_GetPointerProperty(SDL_GetWindowProperties(s_pWindow), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
 #endif
     s_renderWindow.view = SDL_Metal_GetLayer(SDL_Metal_CreateView(s_pWindow));
+#if TARGET_OS_IOS
+    os::ios::ConfigureMetalLayer(s_renderWindow.view);
+#endif
 #else
     static_assert(false, "Unknown platform.");
 #endif

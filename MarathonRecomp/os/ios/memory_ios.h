@@ -53,4 +53,8 @@ namespace os::ios
     // Installs SIGBUS + SIGSEGV demand-commit handlers for any PROT_NONE page inside [guestBase + pageSize, guestBase + guestSize)
     // while keeping the null guard page [guestBase, guestBase + pageSize) protected.
     void InstallGuestMemoryFaultHandler(uint8_t* guestBase, size_t guestSize, size_t pageSize);
+
+    // Configures CAMetalLayer properties on iOS (maximumDrawableCount = 3, allowsNextDrawableTimeout = YES)
+    // so nextDrawable never blocks the Render Thread indefinitely.
+    void ConfigureMetalLayer(void* metalLayer);
 }
