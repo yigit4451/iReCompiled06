@@ -21,7 +21,9 @@ struct DirectoryFileSystem : VirtualFileSystem
         if (fileStream.is_open())
         {
             fileStream.read((char *)(fileData), fileDataMaxByteCount);
-            return !fileStream.bad();
+            const bool ok = !fileStream.bad();
+            fileStream.close();
+            return ok;
         }
         else
         {

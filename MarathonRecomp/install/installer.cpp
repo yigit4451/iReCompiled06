@@ -180,22 +180,64 @@ static bool checkFile(const FilePair &pair, const uint64_t *fileHashes, const st
 }
 
 static bool writeFile(const std::filesystem::path &targetPath, const std::vector<uint8_t>& fileData, Journal &journal, const std::function<bool()> &progressCallback) {
-    std::ofstream outStream(targetPath, std::ios::binary);
-    if (!outStream.is_open())
+    std::error_code dirEc;
+    const std::filesystem::path parentDir = targetPath.parent_path();
+    if (!parentDir.empty())
     {
-        journal.lastResult = Journal::Result::FileCreationFailed;
-        journal.lastErrorMessage = fmt::format("Failed to create file at \"{}\".", fromPath(targetPath));
-        return false;
+        std::filesystem::create_directories(parentDir, dirEc);
     }
 
-    journal.createdFiles.push_back(targetPath);
-
-    outStream.write((const char *)(fileData.data()), fileData.size());
-    if (outStream.bad())
+    errno = 0;
     {
-        journal.lastResult = Journal::Result::FileWriteFailed;
-        journal.lastErrorMessage = fmt::format("Failed to create file at \"{}\".", fromPath(targetPath));
-        return false;
+        std::ofstream outStream(targetPath, std::ios::binary | std::ios::trunc);
+        if (!outStream.is_open())
+        {
+            const int savedErr = errno;
+            journal.lastResult = Journal::Result::FileCreationFailed;
+            journal.lastErrorMessage = fmt::format(
+                "Failed to create file at \"{}\" (errno={} [{}]{}).",
+                fromPath(targetPath),
+                savedErr,
+                std::strerror(savedErr),
+                dirEc ? fmt::format(", dir_error={}", dirEc.message()) : "");
+            return false;
+        }
+
+        journal.createdFiles.push_back(targetPath);
+
+        if (!fileData.empty())
+        {
+            errno = 0;
+            outStream.write((const char *)(fileData.data()), fileData.size());
+        }
+
+        outStream.flush();
+        if (outStream.bad() || outStream.fail())
+        {
+            const int savedErr = errno;
+            outStream.close();
+            journal.lastResult = Journal::Result::FileWriteFailed;
+            journal.lastErrorMessage = fmt::format(
+                "Failed to create file at \"{}\" during write/flush (errno={} [{}]{}).",
+                fromPath(targetPath),
+                savedErr,
+                std::strerror(savedErr),
+                dirEc ? fmt::format(", dir_error={}", dirEc.message()) : "");
+            return false;
+        }
+
+        outStream.close();
+        if (outStream.fail())
+        {
+            const int savedErr = errno;
+            journal.lastResult = Journal::Result::FileWriteFailed;
+            journal.lastErrorMessage = fmt::format(
+                "Failed to close file at \"{}\" (errno={} [{}]).",
+                fromPath(targetPath),
+                savedErr,
+                std::strerror(savedErr));
+            return false;
+        }
     }
 
     journal.progressCounter += fileData.size();
@@ -222,8 +264,10 @@ static bool copyFile(const FilePair &pair, const uint64_t *fileHashes, VirtualFi
 
     if (!sourceVfs.load(filename, fileData))
     {
+        const int savedErr = errno;
         journal.lastResult = Journal::Result::FileReadFailed;
-        journal.lastErrorMessage = fmt::format("Failed to read file \"{}\" from \"{}\".", filename, sourceVfs.getName());
+        journal.lastErrorMessage = fmt::format("Failed to read file \"{}\" from \"{}\" (errno={} [{}]).",
+            filename, sourceVfs.getName(), savedErr, std::strerror(savedErr));
         return false;
     }
 
@@ -246,11 +290,8 @@ static bool copyFile(const FilePair &pair, const uint64_t *fileHashes, VirtualFi
 
     std::filesystem::path targetPath = targetDirectory / std::filesystem::path(std::u8string_view((const char8_t *)(pair.first)));
     std::filesystem::path parentPath = targetPath.parent_path();
-    if (!std::filesystem::exists(parentPath))
-    {
-        std::error_code ec;
-        std::filesystem::create_directories(parentPath, ec);
-    }
+    std::error_code ec;
+    std::filesystem::create_directories(parentPath, ec);
     
     while (!parentPath.empty()) {
         journal.createdDirectories.insert(parentPath);
@@ -263,7 +304,12 @@ static bool copyFile(const FilePair &pair, const uint64_t *fileHashes, VirtualFi
         }
     }
 
-    return writeFile(targetPath, fileData, journal, progressCallback);
+    const bool ok = writeFile(targetPath, fileData, journal, progressCallback);
+    if (fileData.capacity() > (16 * 1024 * 1024))
+    {
+        std::vector<uint8_t>().swap(fileData);
+    }
+    return ok;
 }
 
 static DLC detectDLC(const std::filesystem::path &sourcePath, VirtualFileSystem &sourceVfs, Journal &journal)

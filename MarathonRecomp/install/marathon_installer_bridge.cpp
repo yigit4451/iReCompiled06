@@ -490,19 +490,29 @@ namespace
         }
 
         const std::filesystem::path dstXexPath = gameDir / "default.xex";
+        std::filesystem::create_directories(dstXexPath.parent_path(), ec);
         {
+            errno = 0;
             std::ofstream xexOut(dstXexPath, std::ios::binary | std::ios::trunc);
             if (!xexOut.is_open())
             {
-                outError = "game/default.xex dosyası oluşturulamadı.";
+                const int savedErr = errno;
+                outError = std::string("game/default.xex dosyası oluşturulamadı (errno=") +
+                    std::to_string(savedErr) + " [" + std::strerror(savedErr) + "]).";
                 return false;
             }
+            errno = 0;
             xexOut.write(reinterpret_cast<const char*>(rawBytes.data()), static_cast<std::streamsize>(rawBytes.size()));
+            xexOut.flush();
             if (!xexOut.good())
             {
-                outError = "game/default.xex yazılırken G/Ç hatası oluştu.";
+                const int savedErr = errno;
+                xexOut.close();
+                outError = std::string("game/default.xex yazılırken G/Ç hatası oluştu (errno=") +
+                    std::to_string(savedErr) + " [" + std::strerror(savedErr) + "]).";
                 return false;
             }
+            xexOut.close();
         }
 
         if (progressCallback && !progressCallback(0.45f, rawXexSize, estimatedTotal, "XEX şifresi çözülüyor ve açılıyor (Image::ParseImage)...", userData))
@@ -529,24 +539,34 @@ namespace
         };
 
         const std::filesystem::path decryptedPath = decryptedDir / "default.bin";
+        std::filesystem::create_directories(decryptedPath.parent_path(), ec);
         {
+            errno = 0;
             std::ofstream decOut(decryptedPath, std::ios::binary | std::ios::trunc);
             if (!decOut.is_open())
             {
+                const int savedErr = errno;
                 std::filesystem::remove(dstXexPath, ec);
-                outError = "decrypted/default.bin dosyası oluşturulamadı.";
+                outError = std::string("decrypted/default.bin dosyası oluşturulamadı (errno=") +
+                    std::to_string(savedErr) + " [" + std::strerror(savedErr) + "]).";
                 return false;
             }
 
+            errno = 0;
             decOut.write(reinterpret_cast<const char*>(&header), sizeof(header));
             decOut.write(reinterpret_cast<const char*>(image.data.get()), static_cast<std::streamsize>(image.size));
+            decOut.flush();
             if (!decOut.good())
             {
+                const int savedErr = errno;
+                decOut.close();
                 std::filesystem::remove(decryptedPath, ec);
                 std::filesystem::remove(dstXexPath, ec);
-                outError = "decrypted/default.bin yazılırken G/Ç hatası oluştu.";
+                outError = std::string("decrypted/default.bin yazılırken G/Ç hatası oluştu (errno=") +
+                    std::to_string(savedErr) + " [" + std::strerror(savedErr) + "]).";
                 return false;
             }
+            decOut.close();
         }
 
         const uint64_t finalBytes = rawXexSize + sizeof(header) + image.size;
@@ -815,6 +835,26 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
         }
 
         Installer::Input installerInput{};
+        const bool isInstallingBaseGame =
+            std::filesystem::is_directory(inputPath, ec) ||
+            IsIsoExtension(inputPath) ||
+            IsXexExtension(inputPath);
+
+        if (isInstallingBaseGame)
+        {
+            // Clean up any leftover or partially extracted Documents/iReCompiled06/game (and decrypted) folder
+            // from a previous failed attempt so disk space is reclaimed and no file conflicts occur.
+            std::error_code cleanEc;
+            if (std::filesystem::exists(installRoot / "game", cleanEc))
+            {
+                std::filesystem::remove_all(installRoot / "game", cleanEc);
+            }
+            if (std::filesystem::exists(installRoot / "decrypted", cleanEc))
+            {
+                std::filesystem::remove_all(installRoot / "decrypted", cleanEc);
+            }
+        }
+
         if (std::filesystem::is_directory(inputPath, ec) || IsIsoExtension(inputPath))
         {
             installerInput.gameSource = inputPath;
