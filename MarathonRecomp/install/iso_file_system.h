@@ -11,8 +11,12 @@
 
 #pragma once
 
+#include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <map>
+#include <string>
+#include <tuple>
 
 #include "virtual_file_system.h"
 
@@ -21,15 +25,25 @@
 struct ISOFileSystem : VirtualFileSystem
 {
     MemoryMappedFile mappedFile;
-    std::map<std::string, std::tuple<size_t, size_t>> fileMap;
+    int posixFd = -1;
+    FILE *streamFile = nullptr;
+    uint64_t totalFileSize = 0;
+    std::map<std::string, std::tuple<uint64_t, size_t>> fileMap;
     std::string name;
+    std::string openErrorDetail;
 
     ISOFileSystem(const std::filesystem::path &isoPath);
+    ~ISOFileSystem() override;
     bool load(const std::string &path, uint8_t *fileData, size_t fileDataMaxByteCount) const override;
     size_t getSize(const std::string &path) const override;
     bool exists(const std::string &path) const override;
     const std::string &getName() const override;
     bool empty() const;
+    const std::string &getOpenErrorDetail() const { return openErrorDetail; }
 
-    static std::unique_ptr<ISOFileSystem> create(const std::filesystem::path &isoPath);
+    static std::unique_ptr<ISOFileSystem> create(const std::filesystem::path &isoPath, std::string *outErrorDetail = nullptr);
+
+private:
+    bool readBytesAt(uint64_t offset, void *dst, size_t byteCount) const;
+    void closeHandles();
 };

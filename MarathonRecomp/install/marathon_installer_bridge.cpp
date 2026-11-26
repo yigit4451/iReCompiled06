@@ -1,7 +1,12 @@
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
+
 #include <stdafx.h>
 #include <MarathonInstallerBridge.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <exception>
@@ -12,6 +17,7 @@
 #include <install/iso_file_system.h>
 #include <install/xcontent_file_system.h>
 #include <user/paths.h>
+#include <vector>
 
 #ifdef MARATHON_RECOMP_IOS
 #include <os/ios/sandbox_ios.h>
@@ -55,6 +61,42 @@ namespace
 #endif
     }
 
+    std::filesystem::path GetBaseTempDirectory()
+    {
+        std::error_code ec;
+        std::filesystem::path baseTmpDir = std::filesystem::temp_directory_path(ec);
+        if (ec || baseTmpDir.empty())
+        {
+            baseTmpDir = GetInstallRoot().parent_path() / "tmp";
+        }
+        return baseTmpDir;
+    }
+
+    void PurgeStaleTemporaryExtractionArtifacts()
+    {
+        std::error_code ec;
+        const std::filesystem::path baseTmpDir = GetBaseTempDirectory();
+        if (!std::filesystem::exists(baseTmpDir, ec))
+            return;
+
+        std::filesystem::remove(baseTmpDir / "extracted_game.iso", ec);
+
+        std::vector<std::filesystem::path> staleTargets;
+        for (std::filesystem::directory_iterator it(baseTmpDir, ec), end; it != end && !ec; it.increment(ec))
+        {
+            const std::string name = it->path().filename().string();
+            if (name.rfind("iReCompiled06_7z_", 0) == 0)
+            {
+                staleTargets.push_back(it->path());
+            }
+        }
+
+        for (const auto& target : staleTargets)
+        {
+            std::filesystem::remove_all(target, ec);
+        }
+    }
+
     bool IsXexExtension(const std::filesystem::path& path)
     {
         return LowerAscii(path.extension().string()) == ".xex";
@@ -70,16 +112,23 @@ namespace
         return LowerAscii(path.extension().string()) == ".7z";
     }
 
-    struct ScopedTempDirectoryCleanup
+    struct ScopedTempCleanup
     {
-        std::filesystem::path path;
+        std::vector<std::filesystem::path> paths;
 
-        ~ScopedTempDirectoryCleanup()
+        void add(const std::filesystem::path& p)
         {
-            if (!path.empty())
+            if (!p.empty())
+                paths.push_back(p);
+        }
+
+        ~ScopedTempCleanup()
+        {
+            std::error_code ec;
+            for (const auto& p : paths)
             {
-                std::error_code ec;
-                std::filesystem::remove_all(path, ec);
+                if (!p.empty())
+                    std::filesystem::remove_all(p, ec);
             }
         }
     };
@@ -105,10 +154,19 @@ namespace
 
     bool LocateExtractedPayloadInDirectory(
         const std::filesystem::path& rootDir,
+        const std::filesystem::path& directStandardizedIsoPath,
         std::filesystem::path& outPayloadPath,
         std::string& outError)
     {
         std::error_code ec;
+        if (!directStandardizedIsoPath.empty() &&
+            std::filesystem::exists(directStandardizedIsoPath, ec) &&
+            std::filesystem::file_size(directStandardizedIsoPath, ec) > 0)
+        {
+            outPayloadPath = directStandardizedIsoPath;
+            return true;
+        }
+
         std::filesystem::path foundIso;
         std::filesystem::path foundXexDir;
         std::filesystem::path foundStandaloneXex;
@@ -141,7 +199,10 @@ namespace
 
         if (!foundIso.empty())
         {
-            outPayloadPath = foundIso;
+            const std::filesystem::path standardizedIso = GetBaseTempDirectory() / "extracted_game.iso";
+            std::filesystem::remove(standardizedIso, ec);
+            std::filesystem::rename(foundIso, standardizedIso, ec);
+            outPayloadPath = (!ec && std::filesystem::exists(standardizedIso, ec)) ? standardizedIso : foundIso;
             return true;
         }
 
@@ -163,25 +224,26 @@ namespace
 
     bool Extract7zArchiveToTemp(
         const std::filesystem::path& archivePath,
-        std::filesystem::path& outTempDir,
+        ScopedTempCleanup& tempCleanup,
         std::filesystem::path& outResolvedPayloadPath,
         MarathonExtractionProgressCallback progressCallback,
         void* userData,
         std::string& outError)
     {
         std::error_code ec;
-        std::filesystem::path baseTmpDir = std::filesystem::temp_directory_path(ec);
-        if (ec || baseTmpDir.empty())
-        {
-            baseTmpDir = GetInstallRoot().parent_path() / "tmp";
-        }
+        const std::filesystem::path baseTmpDir = GetBaseTempDirectory();
+        std::filesystem::create_directories(baseTmpDir, ec);
 
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        outTempDir = baseTmpDir / ("iReCompiled06_7z_" + std::to_string(stamp));
-        std::filesystem::create_directories(outTempDir, ec);
+        const std::filesystem::path tempDir = baseTmpDir / ("iReCompiled06_7z_" + std::to_string(stamp));
+        const std::filesystem::path standardizedIsoPath = baseTmpDir / "extracted_game.iso";
+        tempCleanup.add(tempDir);
+        tempCleanup.add(standardizedIsoPath);
+
+        std::filesystem::create_directories(tempDir, ec);
         if (ec)
         {
-            outError = "Geçici .7z çıkartma dizini (tmp/) oluşturulamadı.";
+            outError = "Geçici .7z çıkartma dizini (tmp/) oluşturulamadı: " + ec.message();
             return false;
         }
 
@@ -202,12 +264,15 @@ namespace
         if (archive_read_open_filename(a, archivePathStr.c_str(), 1024 * 256) != ARCHIVE_OK)
         {
             const char* errStr = archive_error_string(a);
-            outError = std::string(".7z arşivi açılamadı: ") + (errStr ? errStr : "Bilinmeyen libarchive hatası.");
+            const int savedErr = errno;
+            outError = std::string(".7z arşivi açılamadı: ") + (errStr ? errStr : "Bilinmeyen libarchive hatası.") +
+                " (errno=" + std::to_string(savedErr) + " [" + std::strerror(savedErr) + "])";
             archive_read_free(a);
             return false;
         }
 
         uint64_t totalUnpackedBytes = 0;
+        bool wroteDirectIso = false;
         struct archive_entry* entry = nullptr;
 
         while (true)
@@ -240,11 +305,10 @@ namespace
                 continue;
             }
 
-            const std::filesystem::path dstPath = outTempDir / relPath;
             const mode_t fileType = archive_entry_filetype(entry);
             if (fileType == AE_IFDIR)
             {
-                std::filesystem::create_directories(dstPath, ec);
+                std::filesystem::create_directories(tempDir / relPath, ec);
                 continue;
             }
 
@@ -254,11 +318,26 @@ namespace
                 continue;
             }
 
+            // Write any .iso entry directly to the standardized ASCII-safe path tmp/extracted_game.iso
+            std::filesystem::path dstPath;
+            if (IsIsoExtension(relPath) && !wroteDirectIso)
+            {
+                dstPath = standardizedIsoPath;
+                wroteDirectIso = true;
+            }
+            else
+            {
+                dstPath = tempDir / relPath;
+            }
+
             std::filesystem::create_directories(dstPath.parent_path(), ec);
+            errno = 0;
             std::ofstream outFile(dstPath, std::ios::binary | std::ios::trunc);
             if (!outFile.is_open())
             {
-                outError = "Geçici dizine dosya yazılamadı: " + relPath.filename().string();
+                const int savedErr = errno;
+                outError = "Geçici dizine dosya yazılamadı (" + dstPath.string() + "): errno=" +
+                    std::to_string(savedErr) + " [" + std::strerror(savedErr) + "]";
                 archive_read_close(a);
                 archive_read_free(a);
                 return false;
@@ -267,7 +346,11 @@ namespace
             const void* chunkBuff = nullptr;
             size_t chunkSize = 0;
             la_int64_t chunkOffset = 0;
-            const std::string entryFilename = relPath.filename().string();
+            const std::string entryFilename = dstPath.filename().string();
+            const la_int64_t entryExpectedSize = archive_entry_size(entry);
+            const uint64_t progressDenominator = (entryExpectedSize > 0)
+                ? static_cast<uint64_t>(entryExpectedSize)
+                : compressedTotalBytes;
 
             while (true)
             {
@@ -296,13 +379,16 @@ namespace
 
                 if (chunkBuff != nullptr && chunkSize > 0)
                 {
+                    errno = 0;
                     outFile.write(static_cast<const char*>(chunkBuff), static_cast<std::streamsize>(chunkSize));
                     if (!outFile.good())
                     {
+                        const int savedErr = errno;
                         outFile.close();
                         archive_read_close(a);
                         archive_read_free(a);
-                        outError = "Geçici diske yazma hatası (cihazda yeterli boş alan olduğundan emin olun).";
+                        outError = std::string("Geçici diske yazma hatası (") + std::strerror(savedErr) +
+                            ", errno=" + std::to_string(savedErr) + "). Cihazda yeterli boş alan olduğundan emin olun.";
                         return false;
                     }
                     totalUnpackedBytes += chunkSize;
@@ -310,15 +396,17 @@ namespace
 
                 if (progressCallback)
                 {
-                    const uint64_t compPos = static_cast<uint64_t>(std::max<la_int64_t>(0, archive_filter_bytes(a, -1)));
                     float archiveRatio = 0.20f;
-                    if (compressedTotalBytes > 0 && compPos > 0)
+                    if (progressDenominator > 0)
                     {
-                        const double frac = std::clamp(static_cast<double>(compPos) / static_cast<double>(compressedTotalBytes), 0.0, 1.0);
+                        const double frac = std::clamp(
+                            static_cast<double>(totalUnpackedBytes) / static_cast<double>(progressDenominator),
+                            0.0,
+                            1.0);
                         archiveRatio = static_cast<float>(0.02 + frac * 0.46);
                     }
                     const std::string msg = ".7z arşivi geçici dizine açılıyor: " + entryFilename;
-                    if (!progressCallback(archiveRatio, totalUnpackedBytes, compressedTotalBytes, msg.c_str(), userData))
+                    if (!progressCallback(archiveRatio, totalUnpackedBytes, progressDenominator, msg.c_str(), userData))
                     {
                         outFile.close();
                         archive_read_close(a);
@@ -328,12 +416,30 @@ namespace
                     }
                 }
             }
+
+            // Explicitly flush and close the output stream before any reader opens the file
+            errno = 0;
+            outFile.flush();
+            outFile.close();
+            if (outFile.fail())
+            {
+                const int savedErr = errno;
+                archive_read_close(a);
+                archive_read_free(a);
+                outError = std::string("Çıkartılan dosya diske kapatılırken (flush/close) hata oluştu: ") +
+                    std::strerror(savedErr) + " (errno=" + std::to_string(savedErr) + ")";
+                return false;
+            }
         }
 
         archive_read_close(a);
         archive_read_free(a);
 
-        return LocateExtractedPayloadInDirectory(outTempDir, outResolvedPayloadPath, outError);
+        return LocateExtractedPayloadInDirectory(
+            tempDir,
+            wroteDirectIso ? standardizedIsoPath : std::filesystem::path{},
+            outResolvedPayloadPath,
+            outError);
     }
 #endif
 
@@ -562,7 +668,11 @@ extern "C" MARATHON_CORE_API MarathonSourceKind ValidateMarathonSource(
         const std::filesystem::path path = std::filesystem::u8path(sourcePath);
         if (!std::filesystem::exists(path, ec))
         {
-            WriteStringToBuffer("Seçilen kaynak dosyaya erişilemiyor.", detailBuffer, detailBufferSize);
+            const int savedErr = errno;
+            WriteStringToBuffer(
+                std::string("Seçilen kaynak dosyaya erişilemiyor (") + std::strerror(savedErr) + ").",
+                detailBuffer,
+                detailBufferSize);
             return MARATHON_SOURCE_INVALID;
         }
 
@@ -585,18 +695,23 @@ extern "C" MARATHON_CORE_API MarathonSourceKind ValidateMarathonSource(
                 WriteStringToBuffer("Seçilen .7z arşivi boş veya okunamıyor.", detailBuffer, detailBufferSize);
                 return MARATHON_SOURCE_INVALID;
             }
-            WriteStringToBuffer("7-Zip (.7z) arşivi doğrulandı (geçici dizine akış halinde açılıp kurulacak).", detailBuffer, detailBufferSize);
+            WriteStringToBuffer("7-Zip (.7z) arşivi doğrulandı (tmp/extracted_game.iso olarak açılıp kurulacak).", detailBuffer, detailBufferSize);
             return MARATHON_SOURCE_7Z_ARCHIVE;
         }
 
         if (IsIsoExtension(path))
         {
-            if (Installer::parseGame(path))
+            std::string isoErr;
+            auto isoFs = ISOFileSystem::create(path, &isoErr);
+            if (isoFs != nullptr && isoFs->exists("default.xex"))
             {
-                WriteStringToBuffer("Xbox 360 ISO kalıbı doğrulandı (doğrudan akışa hazır).", detailBuffer, detailBufferSize);
+                WriteStringToBuffer("Xbox 360 ISO kalıbı doğrulandı (64-bit doğrudan akışa hazır).", detailBuffer, detailBufferSize);
                 return MARATHON_SOURCE_ISO;
             }
-            WriteStringToBuffer("ISO kalıbı içerisinde geçerli Sonic '06 (default.xex) bulunamadı.", detailBuffer, detailBufferSize);
+            const std::string errMsg = !isoErr.empty()
+                ? ("ISO kalıbı açılamadı: " + isoErr)
+                : "ISO kalıbı içerisinde geçerli Sonic '06 (default.xex) bulunamadı.";
+            WriteStringToBuffer(errMsg, detailBuffer, detailBufferSize);
             return MARATHON_SOURCE_INVALID;
         }
 
@@ -651,6 +766,9 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
 #ifdef MARATHON_RECOMP_IOS
         os::ios::EnsureSandboxDirectories();
 #endif
+        // Purge any leftover tmp/iReCompiled06_7z_* directories or tmp/extracted_game.iso from earlier runs
+        PurgeStaleTemporaryExtractionArtifacts();
+
         const std::filesystem::path installRoot = GetInstallRoot();
         std::error_code ec;
         std::filesystem::create_directories(installRoot, ec);
@@ -658,17 +776,22 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
         std::filesystem::path inputPath = std::filesystem::u8path(sourcePath);
         if (!std::filesystem::exists(inputPath, ec))
         {
-            WriteStringToBuffer("Kaynak dosyaya erişilemedi. Bulut dosyasının çevrimiçi olduğundan emin olun.", errorBuffer, errorBufferSize);
+            const int savedErr = errno;
+            WriteStringToBuffer(
+                std::string("Kaynak dosyaya erişilemedi (") + std::strerror(savedErr) +
+                "). Bulut dosyasının çevrimiçi olduğundan emin olun.",
+                errorBuffer,
+                errorBufferSize);
             return false;
         }
 
-        if (progressCallback && !progressCallback(0.01f, 0, 0, "Kaynak doğrulanıyor ve sanal dosya sistemi bağlanıyor...", userData))
+        if (progressCallback && !progressCallback(0.01f, 0, 0, "Eski geçici dosyalar temizlendi, kaynak doğrulanıyor...", userData))
         {
             WriteStringToBuffer("Kurulum kullanıcı tarafından iptal edildi.", errorBuffer, errorBufferSize);
             return false;
         }
 
-        ScopedTempDirectoryCleanup temp7zCleanup{};
+        ScopedTempCleanup temp7zCleanup{};
         float baseProgressOffset = 0.0f;
         float progressScale = 1.0f;
 
@@ -677,7 +800,7 @@ extern "C" MARATHON_CORE_API bool StartMarathonExtraction(
 #if defined(MARATHON_HAS_LIBARCHIVE)
             std::filesystem::path resolvedPayload;
             std::string archiveErr;
-            if (!Extract7zArchiveToTemp(inputPath, temp7zCleanup.path, resolvedPayload, progressCallback, userData, archiveErr))
+            if (!Extract7zArchiveToTemp(inputPath, temp7zCleanup, resolvedPayload, progressCallback, userData, archiveErr))
             {
                 WriteStringToBuffer(archiveErr.empty() ? ".7z arşivi geçici dizine çıkartılamadı." : archiveErr, errorBuffer, errorBufferSize);
                 return false;

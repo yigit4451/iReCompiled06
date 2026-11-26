@@ -1,5 +1,7 @@
 #include "installer.h"
 
+#include <cerrno>
+#include <cstring>
 #include <file.h>
 #include <image.h>
 #include <xxh3.h>
@@ -47,22 +49,65 @@ static std::string toLower(std::string str) {
     return str;
 };
 
-static std::unique_ptr<VirtualFileSystem> createFileSystemFromPath(const std::filesystem::path &path)
+static std::unique_ptr<VirtualFileSystem> createFileSystemFromPath(const std::filesystem::path &path, std::string *outErrorDetail = nullptr)
 {
+    errno = 0;
+    std::error_code ec;
+    const bool pathExists = std::filesystem::exists(path, ec);
+    if (!pathExists)
+    {
+        if (outErrorDetail != nullptr)
+        {
+            const int savedErr = errno;
+            *outErrorDetail = fmt::format("path does not exist (errno={} [{}], fs_error={})",
+                savedErr, std::strerror(savedErr), ec ? ec.message() : "ENOENT");
+        }
+        return nullptr;
+    }
+
     if (XContentFileSystem::check(path))
     {
-        return XContentFileSystem::create(path);
+        errno = 0;
+        auto vfs = XContentFileSystem::create(path);
+        if (!vfs && outErrorDetail != nullptr)
+        {
+            const int savedErr = errno;
+            *outErrorDetail = fmt::format("XContentFileSystem::create failed (errno={} [{}])", savedErr, std::strerror(savedErr));
+        }
+        return vfs;
     }
     else if (toLower(fromPath(path.extension())) == ISOExtension)
     {
-        return ISOFileSystem::create(path);
+        std::string isoErr;
+        auto vfs = ISOFileSystem::create(path, &isoErr);
+        if (!vfs && outErrorDetail != nullptr)
+        {
+            const int savedErr = errno;
+            *outErrorDetail = !isoErr.empty()
+                ? isoErr
+                : fmt::format("ISOFileSystem::create failed (errno={} [{}])", savedErr, std::strerror(savedErr));
+        }
+        return vfs;
     }
-    else if (std::filesystem::is_directory(path))
+    else if (std::filesystem::is_directory(path, ec))
     {
-        return DirectoryFileSystem::create(path);
+        errno = 0;
+        auto vfs = DirectoryFileSystem::create(path);
+        if (!vfs && outErrorDetail != nullptr)
+        {
+            const int savedErr = errno;
+            *outErrorDetail = fmt::format("DirectoryFileSystem::create failed (errno={} [{}])", savedErr, std::strerror(savedErr));
+        }
+        return vfs;
     }
     else
     {
+        if (outErrorDetail != nullptr)
+        {
+            const int savedErr = errno;
+            *outErrorDetail = fmt::format("unsupported source format '{}' (errno={} [{}])",
+                fromPath(path.extension()), savedErr, std::strerror(savedErr));
+        }
         return nullptr;
     }
 }
@@ -463,15 +508,26 @@ bool Installer::copyFiles(std::span<const FilePair> filePairs, const uint64_t *f
 
 bool Installer::parseContent(const std::filesystem::path &sourcePath, std::unique_ptr<VirtualFileSystem> &targetVfs, Journal &journal)
 {
-    targetVfs = createFileSystemFromPath(sourcePath);
+    std::string detail;
+    targetVfs = createFileSystemFromPath(sourcePath, &detail);
     if (targetVfs != nullptr)
     {
         return true;
     }
     else
     {
+        const int savedErr = errno;
         journal.lastResult = Journal::Result::VirtualFileSystemFailed;
-        journal.lastErrorMessage = "Unable to open \"" + fromPath(sourcePath) + "\".";
+        if (!detail.empty())
+        {
+            journal.lastErrorMessage = fmt::format("Unable to open \"{}\": {} (errno={} [{}])",
+                fromPath(sourcePath), detail, savedErr, std::strerror(savedErr));
+        }
+        else
+        {
+            journal.lastErrorMessage = fmt::format("Unable to open \"{}\" (errno={} [{}]).",
+                fromPath(sourcePath), savedErr, std::strerror(savedErr));
+        }
         return false;
     }
 }
