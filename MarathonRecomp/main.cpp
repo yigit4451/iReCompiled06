@@ -141,6 +141,10 @@ uint32_t LdrLoadModule(const std::filesystem::path &path)
     }
 
     const auto loadResult = LoadFile(path);
+    diag.fileSize = loadResult.size();
+    if (!loadResult.empty())
+        diag.fileHash = XXH64(loadResult.data(), loadResult.size(), 0);
+
     if (loadResult.empty())
     {
         diag.loaderStatus = std::filesystem::exists(path, existsEc)

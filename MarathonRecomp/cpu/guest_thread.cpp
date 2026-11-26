@@ -69,50 +69,78 @@ std::string GuestBuildMissingFunctionReport(uint32_t guestAddress)
     }
 
     size_t mappingCount = 0;
+    bool addressRegisteredInMappings = false;
+    uint32_t nearestBelow = 0;
+    uint32_t nearestAbove = 0;
+    uint32_t lowest = 0xFFFFFFFFu;
+    uint32_t highest = 0;
+
     for (size_t i = 0; PPCFuncMappings[i].guest != 0; i++)
+    {
+        const uint32_t guest = static_cast<uint32_t>(PPCFuncMappings[i].guest);
         mappingCount++;
 
-    // A full XenonRecomp build registers tens of thousands of functions. Public CI builds without
-    // MarathonRecompLib/private/default.xex only register the ~hundreds of host hooks (stub build).
-    const bool looksLikeStubBuild = mappingCount < 5000;
+        if (guest == guestAddress)
+            addressRegisteredInMappings = true;
+
+        if (guest <= guestAddress && guest > nearestBelow)
+            nearestBelow = guest;
+
+        if (guest > guestAddress && (nearestAbove == 0 || guest < nearestAbove))
+            nearestAbove = guest;
+
+        lowest = std::min(lowest, guest);
+        highest = std::max(highest, guest);
+    }
+
+    // A full XenonRecomp build registers tens of thousands of functions and writes PPC_IMAGE_SIZE /
+    // PPC_CODE_* from the XEX itself. Public CI builds without MarathonRecompLib/private/default.xex
+    // use tools/generate_stub_recomp.py (hook-only table, fixed 0x1200000 / 0x1000000 constants).
+    const bool smallTable = mappingCount < 5000;
+    const bool stubConstants = diag.imageSize != 0 && diag.imageSize != PPC_IMAGE_SIZE;
+    const bool looksLikeStubBuild = smallTable || stubConstants;
+
+    std::string verdict;
+    if (g_memory.base == nullptr)
+        verdict = "TESHIS: Guest bellek penceresi (g_memory.base) ayrilamadi.";
+    else if (guestAddress == 0)
+        verdict = "TESHIS: Giris noktasi 0 - default.xex / decrypted/default.bin yuklenemedi.";
+    else if (looksLikeStubBuild)
+        verdict = "TESHIS: STUB DERLEME - bu IPA'da XenonRecomp ciktisi (oyun kodu) YOK. "
+                  "Linker stripping veya Title Update sorunu DEGIL; CI'a ASSET_REPO/ASSET_REPO_TOKEN "
+                  "secret'lari ile default.xex + shader.arc + shader_lt.arc eklenmeli.";
+    else if (nearestBelow != 0 && (guestAddress - nearestBelow) < 0x4000 && !addressRegisteredInMappings)
+        verdict = "TESHIS: Tablo tam ama bu adres yok; muhtemelen XEX revizyonu (Title Update / bolge) uyumsuz "
+                  "veya linker bu fonksiyonu atmis.";
+    else
+        verdict = "TESHIS: Tablo bu XEX'e ait gorunmuyor (revizyon/bolge uyumsuzlugu olasi).";
 
     std::error_code ec;
     const auto cwd = std::filesystem::current_path(ec);
 
+    // Most important numbers come first: iOS message boxes get truncated.
     std::string report = fmt::format(
-        "Guest fonksiyonu bulunamadi (nullptr)\n"
-        "- Eksik guest_address (params.function): 0x{:08X}\n"
-        "- XEX entryPoint: 0x{:08X}\n"
-        "- Imaj base/size: 0x{:08X} / 0x{:X} (PPC_IMAGE_BASE=0x{:X}, PPC_IMAGE_SIZE=0x{:X}, PPC_CODE_SIZE=0x{:X})\n"
-        "- Yuklenen modul: {}\n"
-        "- Modul yukleme durumu: {}\n"
-        "- Calisma dizini (cwd): {}\n"
-        "- PPCFuncMappings kayit sayisi: {}\n"
-        "- g_memory.base: {}\n",
-        guestAddress, diag.entryPoint, diag.imageBase, diag.imageSize,
-        (unsigned long long)PPC_IMAGE_BASE, (unsigned long long)PPC_IMAGE_SIZE, (unsigned long long)PPC_CODE_SIZE,
-        diag.modulePath.empty() ? "<yok>" : diag.modulePath,
+        "{}\n"
+        "mapping_count={} | yakin_alt=0x{:08X} | yakin_ust=0x{:08X}\n"
+        "tablo_aralik=0x{:08X}..0x{:08X} | adres_kayitli={}\n"
+        "eksik=0x{:08X} entry=0x{:08X}\n"
+        "imaj base/size=0x{:08X}/0x{:X} | PPC_IMAGE_SIZE=0x{:X} PPC_CODE=0x{:X}+0x{:X}\n"
+        "xex dosya boyutu={} XXH64={:016X}\n"
+        "yukleme: {}\n"
+        "modul: {}\n"
+        "cwd: {}\n"
+        "g_memory.base: {}\n",
+        verdict,
+        mappingCount, nearestBelow, nearestAbove,
+        mappingCount ? lowest : 0u, highest, addressRegisteredInMappings ? "evet" : "hayir",
+        guestAddress, diag.entryPoint,
+        diag.imageBase, diag.imageSize,
+        (unsigned long long)PPC_IMAGE_SIZE, (unsigned long long)PPC_CODE_BASE, (unsigned long long)PPC_CODE_SIZE,
+        (unsigned long long)diag.fileSize, (unsigned long long)diag.fileHash,
         diag.loaderStatus.empty() ? "<bilinmiyor>" : diag.loaderStatus,
+        diag.modulePath.empty() ? "<yok>" : diag.modulePath,
         ec ? "<alinamadi>" : cwd.string(),
-        mappingCount,
-        g_memory.base != nullptr ? "eslenmis" : "NULL (bellek ayrilamadi)");
-
-    if (looksLikeStubBuild)
-    {
-        report += "\nUYARI: Bu IPA, MarathonRecompLib/private/default.xex olmadan 'stub' PPC tablosuyla "
-                  "derlenmis (yalnizca host hook'lari kayitli). Oyun kodu (XenonRecomp ciktisi) pakette "
-                  "yok; ASSET_REPO / ASSET_REPO_TOKEN GitHub secret'lari tanimlanip CI yeniden "
-                  "calistirilmalidir.\n";
-    }
-    else if (guestAddress == 0)
-    {
-        report += "\nNOT: Giris noktasi 0; default.xex / decrypted/default.bin yuklenemedi veya bos.\n";
-    }
-    else if (guestAddress < PPC_CODE_BASE || guestAddress >= PPC_CODE_BASE + PPC_CODE_SIZE)
-    {
-        report += "\nNOT: Adres PPC_CODE_BASE..PPC_CODE_BASE+PPC_CODE_SIZE araliginin disinda; "
-                  "XEX, recomp edilen surumle uyusmuyor olabilir (farkli TU/title update).\n";
-    }
+        g_memory.base != nullptr ? "eslenmis" : "NULL");
 
     return report;
 }

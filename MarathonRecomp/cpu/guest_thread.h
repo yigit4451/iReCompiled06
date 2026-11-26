@@ -47,6 +47,8 @@ struct GuestModuleDiagnostics
     uint32_t imageSize = 0;
     std::string modulePath;
     std::string loaderStatus;
+    uint64_t fileSize = 0;
+    uint64_t fileHash = 0; // XXH64 of the loaded default.xex / default.bin file
 };
 
 void GuestSetModuleDiagnostics(const GuestModuleDiagnostics& diagnostics);
