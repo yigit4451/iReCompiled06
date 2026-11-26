@@ -1279,6 +1279,136 @@ namespace plume {
                 *outEffectiveRenderFmt = requestedRenderFmt;
             return pixelFormat;
         }
+        bool isDepthOrStencilPixelFormat(MTL::PixelFormat pixelFormat) {
+            switch (pixelFormat) {
+                case MTL::PixelFormatDepth16Unorm:
+                case MTL::PixelFormatDepth32Float:
+                case MTL::PixelFormatStencil8:
+                case MTL::PixelFormatDepth24Unorm_Stencil8:
+                case MTL::PixelFormatDepth32Float_Stencil8:
+                case MTL::PixelFormatX32_Stencil8:
+                case MTL::PixelFormatX24_Stencil8:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        uint32_t metalPixelFormatBitSize(MTL::PixelFormat pixelFormat) {
+            switch (pixelFormat) {
+                case MTL::PixelFormatR8Unorm:
+                case MTL::PixelFormatR8Unorm_sRGB:
+                case MTL::PixelFormatR8Snorm:
+                case MTL::PixelFormatR8Uint:
+                case MTL::PixelFormatR8Sint:
+                case MTL::PixelFormatA8Unorm:
+                case MTL::PixelFormatStencil8:
+                    return 8;
+                case MTL::PixelFormatR16Unorm:
+                case MTL::PixelFormatR16Snorm:
+                case MTL::PixelFormatR16Uint:
+                case MTL::PixelFormatR16Sint:
+                case MTL::PixelFormatR16Float:
+                case MTL::PixelFormatRG8Unorm:
+                case MTL::PixelFormatRG8Unorm_sRGB:
+                case MTL::PixelFormatRG8Snorm:
+                case MTL::PixelFormatRG8Uint:
+                case MTL::PixelFormatRG8Sint:
+                case MTL::PixelFormatB5G6R5Unorm:
+                case MTL::PixelFormatA1BGR5Unorm:
+                case MTL::PixelFormatABGR4Unorm:
+                case MTL::PixelFormatBGR5A1Unorm:
+                case MTL::PixelFormatDepth16Unorm:
+                    return 16;
+                case MTL::PixelFormatR32Uint:
+                case MTL::PixelFormatR32Sint:
+                case MTL::PixelFormatR32Float:
+                case MTL::PixelFormatRG16Unorm:
+                case MTL::PixelFormatRG16Snorm:
+                case MTL::PixelFormatRG16Uint:
+                case MTL::PixelFormatRG16Sint:
+                case MTL::PixelFormatRG16Float:
+                case MTL::PixelFormatRGBA8Unorm:
+                case MTL::PixelFormatRGBA8Unorm_sRGB:
+                case MTL::PixelFormatRGBA8Snorm:
+                case MTL::PixelFormatRGBA8Uint:
+                case MTL::PixelFormatRGBA8Sint:
+                case MTL::PixelFormatBGRA8Unorm:
+                case MTL::PixelFormatBGRA8Unorm_sRGB:
+                case MTL::PixelFormatRGB10A2Unorm:
+                case MTL::PixelFormatRGB10A2Uint:
+                case MTL::PixelFormatRG11B10Float:
+                case MTL::PixelFormatRGB9E5Float:
+                case MTL::PixelFormatBGR10A2Unorm:
+                case MTL::PixelFormatDepth32Float:
+                case MTL::PixelFormatDepth24Unorm_Stencil8:
+                case MTL::PixelFormatX24_Stencil8:
+                    return 32;
+                case MTL::PixelFormatRG32Uint:
+                case MTL::PixelFormatRG32Sint:
+                case MTL::PixelFormatRG32Float:
+                case MTL::PixelFormatRGBA16Unorm:
+                case MTL::PixelFormatRGBA16Snorm:
+                case MTL::PixelFormatRGBA16Uint:
+                case MTL::PixelFormatRGBA16Sint:
+                case MTL::PixelFormatRGBA16Float:
+                case MTL::PixelFormatDepth32Float_Stencil8:
+                case MTL::PixelFormatX32_Stencil8:
+                case MTL::PixelFormatBC1_RGBA:
+                case MTL::PixelFormatBC1_RGBA_sRGB:
+                case MTL::PixelFormatBC4_RUnorm:
+                case MTL::PixelFormatBC4_RSnorm:
+                    return 64;
+                case MTL::PixelFormatRGBA32Uint:
+                case MTL::PixelFormatRGBA32Sint:
+                case MTL::PixelFormatRGBA32Float:
+                case MTL::PixelFormatBC2_RGBA:
+                case MTL::PixelFormatBC2_RGBA_sRGB:
+                case MTL::PixelFormatBC3_RGBA:
+                case MTL::PixelFormatBC3_RGBA_sRGB:
+                case MTL::PixelFormatBC5_RGUnorm:
+                case MTL::PixelFormatBC5_RGSnorm:
+                case MTL::PixelFormatBC6H_RGBFloat:
+                case MTL::PixelFormatBC6H_RGBUfloat:
+                case MTL::PixelFormatBC7_RGBAUnorm:
+                case MTL::PixelFormatBC7_RGBAUnorm_sRGB:
+                    return 128;
+                default:
+                    return 0;
+            }
+        }
+
+        bool areMetalViewFormatsCompatible(MTL::PixelFormat parentFmt, MTL::PixelFormat viewFmt) {
+            if (viewFmt == MTL::PixelFormatInvalid) {
+                return false;
+            }
+            if (parentFmt == viewFmt) {
+                return true;
+            }
+            if (isBCPixelFormat(parentFmt) != isBCPixelFormat(viewFmt)) {
+                return false;
+            }
+            if (isDepthOrStencilPixelFormat(parentFmt) != isDepthOrStencilPixelFormat(viewFmt)) {
+                return false;
+            }
+            if (isDepthOrStencilPixelFormat(parentFmt)) {
+                // Only stencil view of Depth32Float_Stencil8 (X32_Stencil8) or exact match is valid on iOS Metal
+                if (parentFmt == MTL::PixelFormatDepth32Float_Stencil8 && viewFmt == MTL::PixelFormatX32_Stencil8)
+                    return true;
+                return false;
+            }
+            const uint32_t parentBits = metalPixelFormatBitSize(parentFmt);
+            const uint32_t viewBits = metalPixelFormatBitSize(viewFmt);
+            return parentBits > 0 && parentBits == viewBits;
+        }
+
+        bool isIdentityComponentMapping(const RenderComponentMapping &mapping) {
+            const bool rIdentity = (mapping.r == RenderSwizzle::IDENTITY || mapping.r == RenderSwizzle::R);
+            const bool gIdentity = (mapping.g == RenderSwizzle::IDENTITY || mapping.g == RenderSwizzle::G);
+            const bool bIdentity = (mapping.b == RenderSwizzle::IDENTITY || mapping.b == RenderSwizzle::B);
+            const bool aIdentity = (mapping.a == RenderSwizzle::IDENTITY || mapping.a == RenderSwizzle::A);
+            return rIdentity && gIdentity && bIdentity && aIdentity;
+        }
     }
 
     // MetalTexture
@@ -1319,7 +1449,6 @@ namespace plume {
         RenderFormat effectiveFormat = safeDesc.format;
         const MTL::PixelFormat validPixelFormat = sanitizeMetalPixelFormat(device->mtl, safeDesc.format, rawPixelFormat, &effectiveFormat);
         safeDesc.format = effectiveFormat;
-        this->desc = safeDesc;
 
         MTL::TextureDescriptor *descriptor = MTL::TextureDescriptor::alloc()->init();
         MTL::TextureType textureType = mapTextureType(safeDesc.dimension, safeDesc.multisampling.sampleCount, safeDesc.arraySize);
@@ -1329,8 +1458,12 @@ namespace plume {
                 safeDesc.width = cubeEdge;
                 safeDesc.height = cubeEdge;
             }
+            if (safeDesc.arraySize < 6u) {
+                safeDesc.arraySize = 6u;
+            }
             textureType = (safeDesc.arraySize > 6u) ? MTL::TextureTypeCubeArray : MTL::TextureTypeCube;
         }
+        this->desc = safeDesc;
 
         descriptor->setTextureType(textureType);
         descriptor->setStorageMode(MTL::StorageModePrivate);
@@ -1345,6 +1478,10 @@ namespace plume {
         MTL::TextureUsage usage = mapTextureUsage(safeDesc.flags);
         if (usage == MTL::TextureUsageUnknown) {
             usage = MTL::TextureUsageShaderRead;
+        }
+        usage |= MTL::TextureUsageShaderRead;
+        if (!isDepthOrStencilPixelFormat(validPixelFormat)) {
+            usage |= MTL::TextureUsagePixelFormatView;
         }
         // Add shader write usage if this texture might be used as a resolve target
         if (safeDesc.multisampling.sampleCount == 1 && (usage & MTL::TextureUsageRenderTarget)) {
@@ -1365,7 +1502,7 @@ namespace plume {
             descriptor->setMipmapLevelCount(1);
             descriptor->setArrayLength(1);
             descriptor->setSampleCount(1);
-            descriptor->setUsage(MTL::TextureUsageShaderRead);
+            descriptor->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsagePixelFormatView);
             this->desc.width = 1;
             this->desc.height = 1;
             this->desc.depth = 1;
@@ -1397,7 +1534,9 @@ namespace plume {
 
     void MetalTexture::setName(const std::string &name) {
         MetalAutoreleasePool releasePool;
-        mtl->setLabel(NS::String::string(name.c_str(), NS::UTF8StringEncoding));
+        if (mtl != nullptr) {
+            mtl->setLabel(NS::String::string(name.c_str(), NS::UTF8StringEncoding));
+        }
     }
 
     // MetalTextureView
@@ -1411,44 +1550,157 @@ namespace plume {
 
         MetalAutoreleasePool releasePool;
         this->parentTexture = texture;
+        this->texture = nullptr;
+        this->desc = inViewDesc;
+
+        if (texture->mtl == nullptr) {
+            return;
+        }
+
+        const MTL::PixelFormat parentPixelFormat = texture->mtl->pixelFormat();
+        const MTL::TextureType parentTextureType = texture->mtl->textureType();
+        const NS::UInteger actualParentMips = std::max<NS::UInteger>(1u, texture->mtl->mipmapLevelCount());
+
+        // In Metal, total slice count of the underlying texture is 6 * arrayLength for Cube/CubeArray, and arrayLength otherwise.
+        const bool parentIsCubeOrCubeArray = (parentTextureType == MTL::TextureTypeCube || parentTextureType == MTL::TextureTypeCubeArray);
+        const NS::UInteger actualParentSlices = parentIsCubeOrCubeArray
+            ? std::max<NS::UInteger>(6u, texture->mtl->arrayLength() * 6u)
+            : std::max<NS::UInteger>(1u, texture->mtl->arrayLength());
+
+        // Clamp baseMip into [0, actualParentMips - 1] and mipCount into [1, actualParentMips - baseMip]
+        const NS::UInteger baseMip = std::min<NS::UInteger>(inViewDesc.mipSlice, actualParentMips - 1u);
+        const NS::UInteger requestedMips = (inViewDesc.mipLevels == 0 || inViewDesc.mipLevels == UINT32_MAX)
+            ? (actualParentMips - baseMip)
+            : static_cast<NS::UInteger>(inViewDesc.mipLevels);
+        const NS::UInteger mipCount = std::max<NS::UInteger>(1u, std::min<NS::UInteger>(requestedMips, actualParentMips - baseMip));
+
+        // Clamp baseSlice into [0, actualParentSlices - 1] and sliceCount into [1, actualParentSlices - baseSlice]
+        const NS::UInteger baseSlice = std::min<NS::UInteger>(inViewDesc.arrayIndex, actualParentSlices - 1u);
+        const NS::UInteger requestedSlices = (inViewDesc.arraySize == 0 || inViewDesc.arraySize == UINT32_MAX)
+            ? (actualParentSlices - baseSlice)
+            : static_cast<NS::UInteger>(inViewDesc.arraySize);
+        NS::UInteger sliceCount = std::max<NS::UInteger>(1u, std::min<NS::UInteger>(requestedSlices, actualParentSlices - baseSlice));
 
         RenderTextureViewDesc safeViewDesc = inViewDesc;
-        const uint32_t parentMips = std::max(1u, texture->desc.mipLevels);
-        const uint32_t parentLayers = std::max(1u, texture->desc.arraySize);
-        const uint32_t safeMipSlice = std::min(inViewDesc.mipSlice, parentMips - 1u);
-        const uint32_t safeArrayIndex = std::min(inViewDesc.arrayIndex, parentLayers - 1u);
-        const uint32_t mipLevels = std::clamp(inViewDesc.mipLevels == 0 ? (parentMips - safeMipSlice) : inViewDesc.mipLevels, 1u, parentMips - safeMipSlice);
-        const uint32_t arraySize = std::clamp(inViewDesc.arraySize == 0 ? (parentLayers - safeArrayIndex) : inViewDesc.arraySize, 1u, parentLayers - safeArrayIndex);
+        safeViewDesc.mipSlice = static_cast<uint32_t>(baseMip);
+        safeViewDesc.mipLevels = static_cast<uint32_t>(mipCount);
+        safeViewDesc.arrayIndex = static_cast<uint32_t>(baseSlice);
+        safeViewDesc.arraySize = static_cast<uint32_t>(sliceCount);
 
-        MTL::PixelFormat viewPixelFormat = sanitizeMetalPixelFormat(texture->device ? texture->device->mtl : nullptr, safeViewDesc.format, mapPixelFormat(safeViewDesc.format), &safeViewDesc.format);
-        if (texture->mtl != nullptr && isBCPixelFormat(viewPixelFormat) != isBCPixelFormat(texture->mtl->pixelFormat())) {
-            viewPixelFormat = texture->mtl->pixelFormat();
+        MTL::PixelFormat requestedMtlFormat = mapPixelFormat(safeViewDesc.format);
+        requestedMtlFormat = sanitizeMetalPixelFormat(texture->device ? texture->device->mtl : nullptr, safeViewDesc.format, requestedMtlFormat, &safeViewDesc.format);
+
+        MTL::PixelFormat viewPixelFormat = parentPixelFormat;
+        if (areMetalViewFormatsCompatible(parentPixelFormat, requestedMtlFormat)) {
+            viewPixelFormat = requestedMtlFormat;
+        } else {
+            std::fprintf(stderr, "[plume::MetalTextureView] Incompatible view pixelFormat=%lu for parent pixelFormat=%lu; using parent pixelFormat.\n",
+                         static_cast<unsigned long>(requestedMtlFormat),
+                         static_cast<unsigned long>(parentPixelFormat));
+            viewPixelFormat = parentPixelFormat;
         }
+
+        MTL::TextureType viewType = mapTextureViewType(safeViewDesc.dimension, texture->mtl->sampleCount(), static_cast<uint32_t>(sliceCount));
+        if (texture->mtl->sampleCount() > 1) {
+            viewType = (actualParentSlices > 1) ? MTL::TextureType2DMultisampleArray : MTL::TextureType2DMultisample;
+        } else if (viewType == MTL::TextureTypeCube) {
+            if (actualParentSlices < 6u) {
+                viewType = (actualParentSlices > 1u) ? MTL::TextureType2DArray : MTL::TextureType2D;
+            } else {
+                const NS::UInteger alignedBase = (baseSlice + 6u <= actualParentSlices) ? baseSlice : (actualParentSlices - 6u);
+                safeViewDesc.arrayIndex = static_cast<uint32_t>(alignedBase);
+                sliceCount = 6u;
+            }
+        } else if (viewType == MTL::TextureTypeCubeArray) {
+            if (actualParentSlices < 6u) {
+                viewType = (actualParentSlices > 1u) ? MTL::TextureType2DArray : MTL::TextureType2D;
+            } else {
+                const NS::UInteger cubeCount = std::max<NS::UInteger>(1u, sliceCount / 6u);
+                sliceCount = std::min<NS::UInteger>(cubeCount * 6u, actualParentSlices - safeViewDesc.arrayIndex);
+                if (sliceCount < 6u) {
+                    viewType = (actualParentSlices > 1u) ? MTL::TextureType2DArray : MTL::TextureType2D;
+                    sliceCount = std::max<NS::UInteger>(1u, actualParentSlices - safeViewDesc.arrayIndex);
+                }
+            }
+        } else if (viewType == MTL::TextureType2D) {
+            sliceCount = 1u;
+        } else if (viewType == MTL::TextureType3D) {
+            if (parentTextureType != MTL::TextureType3D) {
+                viewType = parentTextureType;
+            }
+            sliceCount = 1u;
+        }
+
+        const NS::UInteger finalBaseSlice = std::min<NS::UInteger>(safeViewDesc.arrayIndex, actualParentSlices - 1u);
+        const NS::UInteger finalSliceCount = std::max<NS::UInteger>(1u, std::min<NS::UInteger>(sliceCount, actualParentSlices - finalBaseSlice));
+        safeViewDesc.arrayIndex = static_cast<uint32_t>(finalBaseSlice);
+        safeViewDesc.arraySize = static_cast<uint32_t>(finalSliceCount);
         this->desc = safeViewDesc;
 
-        if (texture->mtl != nullptr) {
-            const MTL::TextureType viewType = mapTextureViewType(safeViewDesc.dimension, texture->desc.multisampling.sampleCount, arraySize);
-            const NS::UInteger mtlSliceLen = (viewType == MTL::TextureTypeCube)
-                ? ((texture->mtl->textureType() == MTL::TextureTypeCube || texture->mtl->textureType() == MTL::TextureTypeCubeArray) ? 1u : 6u)
-                : ((viewType == MTL::TextureTypeCubeArray && (texture->mtl->textureType() == MTL::TextureTypeCube || texture->mtl->textureType() == MTL::TextureTypeCubeArray)) ? std::max(1u, arraySize / 6u) : arraySize);
-            const NS::UInteger mtlSliceBase = (viewType == MTL::TextureTypeCube || viewType == MTL::TextureTypeCubeArray) && (texture->mtl->textureType() == MTL::TextureTypeCube || texture->mtl->textureType() == MTL::TextureTypeCubeArray)
-                ? (safeArrayIndex / 6u)
-                : safeArrayIndex;
+        const bool hasCustomSwizzle = !isIdentityComponentMapping(safeViewDesc.componentMapping);
+        const bool sameFormat = (viewPixelFormat == parentPixelFormat);
+        const bool sameType = (viewType == parentTextureType);
+        const bool coversFullMips = (baseMip == 0u && mipCount == actualParentMips);
+        const bool coversFullSlices = (finalBaseSlice == 0u && finalSliceCount == actualParentSlices);
 
+        // Share the parent MTLTexture directly when no format/type/subrange/swizzle override is needed,
+        // or when the texture does not carry MTLTextureUsagePixelFormatView (e.g. depth/stencil targets).
+        const bool parentAllowsFormatOrSwizzleView = (texture->mtl->usage() & MTL::TextureUsagePixelFormatView) != 0;
+        if (sameFormat && sameType && coversFullMips && coversFullSlices && (!hasCustomSwizzle || !parentAllowsFormatOrSwizzleView)) {
+            this->texture = texture->mtl->retain();
+            return;
+        }
+
+        if (!hasCustomSwizzle) {
+            if (sameType && coversFullMips && coversFullSlices) {
+                this->texture = parentAllowsFormatOrSwizzleView
+                    ? texture->mtl->newTextureView(viewPixelFormat)
+                    : texture->mtl->retain();
+            } else {
+                const MTL::PixelFormat safeSubrangeFmt = parentAllowsFormatOrSwizzleView ? viewPixelFormat : parentPixelFormat;
+                this->texture = texture->mtl->newTextureView(
+                    safeSubrangeFmt,
+                    viewType,
+                    { baseMip, mipCount },
+                    { finalBaseSlice, finalSliceCount }
+                );
+            }
+        } else if (parentAllowsFormatOrSwizzleView) {
             this->texture = texture->mtl->newTextureView(
                 viewPixelFormat,
                 viewType,
-                { safeMipSlice, mipLevels },
-                { mtlSliceBase, mtlSliceLen },
+                { baseMip, mipCount },
+                { finalBaseSlice, finalSliceCount },
                 mapTextureSwizzleChannels(safeViewDesc.componentMapping)
             );
-            if (this->texture == nullptr) {
-                std::fprintf(stderr, "[plume::MetalTextureView] ERROR: newTextureView returned nil (viewFmt=%lu, parentFmt=%lu, mips=%u..+%u, layers=%u..+%u). Retrying with parent pixelFormat.\n",
-                             static_cast<unsigned long>(viewPixelFormat),
-                             static_cast<unsigned long>(texture->mtl->pixelFormat()),
-                             safeMipSlice, mipLevels, safeArrayIndex, arraySize);
-                this->texture = texture->mtl->newTextureView(texture->mtl->pixelFormat());
+        } else {
+            // Depth/stencil textures do not allow MTLTextureUsagePixelFormatView on iOS Metal;
+            // create a subrange view without custom swizzle (or retain parent if full range).
+            if (sameType && coversFullMips && coversFullSlices) {
+                this->texture = texture->mtl->retain();
+            } else {
+                this->texture = texture->mtl->newTextureView(
+                    parentPixelFormat,
+                    viewType,
+                    { baseMip, mipCount },
+                    { finalBaseSlice, finalSliceCount }
+                );
             }
+        }
+
+        if (this->texture == nullptr) {
+            std::fprintf(stderr, "[plume::MetalTextureView] ERROR: newTextureView returned nil (viewFmt=%lu, parentFmt=%lu, viewType=%lu, parentType=%lu, mips=%lu..+%lu/%lu, slices=%lu..+%lu/%lu). Sharing parent MTLTexture.\n",
+                         static_cast<unsigned long>(viewPixelFormat),
+                         static_cast<unsigned long>(parentPixelFormat),
+                         static_cast<unsigned long>(viewType),
+                         static_cast<unsigned long>(parentTextureType),
+                         static_cast<unsigned long>(baseMip),
+                         static_cast<unsigned long>(mipCount),
+                         static_cast<unsigned long>(actualParentMips),
+                         static_cast<unsigned long>(finalBaseSlice),
+                         static_cast<unsigned long>(finalSliceCount),
+                         static_cast<unsigned long>(actualParentSlices));
+            this->texture = texture->mtl->retain();
         }
     }
 

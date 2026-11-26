@@ -1472,6 +1472,7 @@ bool Video::CreateHostDevice(const char* sdlVideoDriver, bool graphicsApiRetry)
             desc.dimension = RenderTextureDimension::TEXTURE_2D;
             desc.arraySize = 1;
             viewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D;
+            viewDesc.arraySize = 1;
             break;
 
         case TEXTURE_DESCRIPTOR_NULL_TEXTURE_CUBE:
@@ -1479,6 +1480,7 @@ bool Video::CreateHostDevice(const char* sdlVideoDriver, bool graphicsApiRetry)
             desc.arraySize = 6;
             desc.flags = RenderTextureFlag::CUBE;
             viewDesc.dimension = RenderTextureViewDimension::TEXTURE_CUBE;
+            viewDesc.arraySize = 6;
             break;
 
         default:
