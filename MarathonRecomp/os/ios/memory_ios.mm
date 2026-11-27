@@ -1003,6 +1003,8 @@ namespace
 
         if ([self hitButtonAtPoint:pt] >= 0)
         {
+            if (_buttonTouches == nil)
+                _buttonTouches = [[NSMutableSet alloc] init];
             [_buttonTouches addObject:t];
         }
         else if (_leftStickTouch == nil && [self isPointInsideLeftStickZone:pt])
@@ -1035,7 +1037,8 @@ namespace
             _leftStickTouch = nil;
         if (t == _rightLookTouch)
             _rightLookTouch = nil;
-        [_buttonTouches removeObject:t];
+        if (_buttonTouches != nil)
+            [_buttonTouches removeObject:t];
     }
 
     [self recomputeControllerState];
@@ -1051,13 +1054,16 @@ namespace
             _leftStickTouch = nil;
         if (t == _rightLookTouch)
             _rightLookTouch = nil;
-        [_buttonTouches removeObject:t];
+        if (_buttonTouches != nil)
+            [_buttonTouches removeObject:t];
     }
 
     [self recomputeControllerState];
 }
 
 @end
+
+static MarathonTouchOverlayView* g_touchOverlayInstance = nil;
 
 void os::ios::InstallTouchControllerOverlay(void* uiWindowPtr)
 {
@@ -1075,21 +1081,21 @@ void os::ios::InstallTouchControllerOverlay(void* uiWindowPtr)
             if (rootView == nil)
                 return;
 
-            for (UIView* sub in rootView.subviews)
+            if (g_touchOverlayInstance != nil)
             {
-                if ([sub isKindOfClass:[MarathonTouchOverlayView class]])
+                if (g_touchOverlayInstance.superview != rootView)
                 {
-                    [rootView bringSubviewToFront:sub];
-                    return;
+                    g_touchOverlayInstance.frame = rootView.bounds;
+                    [rootView addSubview:g_touchOverlayInstance];
                 }
+                [rootView bringSubviewToFront:g_touchOverlayInstance];
+                return;
             }
 
             MarathonTouchOverlayView* overlay = [[MarathonTouchOverlayView alloc] initWithFrame:rootView.bounds];
+            g_touchOverlayInstance = overlay; // Retained globally (+1 in Non-ARC, strong in ARC)
             [rootView addSubview:overlay];
             [rootView bringSubviewToFront:overlay];
-#if !__has_feature(objc_arc)
-            [overlay release];
-#endif
         }
     });
 }

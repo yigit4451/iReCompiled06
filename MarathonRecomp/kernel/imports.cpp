@@ -43,32 +43,40 @@ struct Event final : KernelObject, HostObject<XKEVENT>
         {
             if (manualReset)
             {
-                if (!signaled)
+                if (!signaled.load(std::memory_order_acquire))
                     return STATUS_TIMEOUT;
             }
             else
             {
                 bool expected = true;
-                if (!signaled.compare_exchange_strong(expected, false))
+                if (!signaled.compare_exchange_strong(expected, false, std::memory_order_acq_rel))
                     return STATUS_TIMEOUT;
             }
         }
         else if (timeout == INFINITE)
         {
-            if (manualReset)
+            // Avoid unbounded std::atomic::wait on Darwin/iOS ulock where rapid Set()/Wait() transitions
+            // across 20+ GuestWorker threads (FrameSynchronizerThread / FrustumCullingThread / XAudio)
+            // can miss an edge wakeup and leave GuestMain (sub_82586AC0 -> NtWaitForSingleObjectEx) stuck forever.
+            uint32_t spins = 0;
+            while (true)
             {
-                signaled.wait(false);
-            }
-            else
-            {
-                while (true)
+                if (manualReset)
+                {
+                    if (signaled.load(std::memory_order_acquire))
+                        return STATUS_SUCCESS;
+                }
+                else
                 {
                     bool expected = true;
-                    if (signaled.compare_exchange_weak(expected, false))
-                        break;
-
-                    signaled.wait(expected);
+                    if (signaled.compare_exchange_strong(expected, false, std::memory_order_acq_rel))
+                        return STATUS_SUCCESS;
                 }
+
+                if (++spins < 64)
+                    std::this_thread::yield();
+                else
+                    std::this_thread::sleep_for(std::chrono::microseconds(250));
             }
         }
         else
@@ -84,14 +92,14 @@ struct Event final : KernelObject, HostObject<XKEVENT>
                 else
                 {
                     bool expected = true;
-                    if (signaled.compare_exchange_strong(expected, false))
+                    if (signaled.compare_exchange_strong(expected, false, std::memory_order_acq_rel))
                         return STATUS_SUCCESS;
                 }
 
                 if (std::chrono::steady_clock::now() >= deadline)
                     return STATUS_TIMEOUT;
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
             }
         }
 
@@ -100,7 +108,7 @@ struct Event final : KernelObject, HostObject<XKEVENT>
 
     bool Set()
     {
-        signaled = true;
+        signaled.store(true, std::memory_order_release);
 
         if (manualReset)
             signaled.notify_all();
@@ -112,7 +120,7 @@ struct Event final : KernelObject, HostObject<XKEVENT>
 
     bool Reset()
     {
-        signaled = false;
+        signaled.store(false, std::memory_order_release);
         return TRUE;
     }
 };
@@ -138,10 +146,10 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
     {
         if (timeout == 0)
         {
-            uint32_t currentCount = count.load();
+            uint32_t currentCount = count.load(std::memory_order_acquire);
             if (currentCount != 0)
             {
-                if (count.compare_exchange_weak(currentCount, currentCount - 1))
+                if (count.compare_exchange_weak(currentCount, currentCount - 1, std::memory_order_acq_rel))
                     return STATUS_SUCCESS;
             }
 
@@ -149,36 +157,32 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
         }
         else if (timeout == INFINITE)
         {
-            uint32_t currentCount;
+            uint32_t spins = 0;
             while (true)
             {
-                currentCount = count.load();
-                if (currentCount != 0)
-                {
-                    if (count.compare_exchange_weak(currentCount, currentCount - 1))
-                        return STATUS_SUCCESS;
-                }
-                else
-                {
-                    count.wait(0);
-                }
-            }
+                uint32_t currentCount = count.load(std::memory_order_acquire);
+                if (currentCount != 0 && count.compare_exchange_weak(currentCount, currentCount - 1, std::memory_order_acq_rel))
+                    return STATUS_SUCCESS;
 
-            return STATUS_SUCCESS;
+                if (++spins < 64)
+                    std::this_thread::yield();
+                else
+                    std::this_thread::sleep_for(std::chrono::microseconds(250));
+            }
         }
         else
         {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
             while (true)
             {
-                uint32_t currentCount = count.load();
-                if (currentCount != 0 && count.compare_exchange_weak(currentCount, currentCount - 1))
+                uint32_t currentCount = count.load(std::memory_order_acquire);
+                if (currentCount != 0 && count.compare_exchange_weak(currentCount, currentCount - 1, std::memory_order_acq_rel))
                     return STATUS_SUCCESS;
 
                 if (std::chrono::steady_clock::now() >= deadline)
                     return STATUS_TIMEOUT;
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
             }
         }
     }
@@ -190,7 +194,7 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
 
         assert(count + releaseCount <= maximumCount);
 
-        count += releaseCount;
+        count.fetch_add(releaseCount, std::memory_order_acq_rel);
         count.notify_all();
     }
 };
@@ -492,12 +496,41 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode, uint32_t Al
 
     uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
     const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    const uint32_t callerCtr = g_ppcContext ? g_ppcContext->ctr.u32 : 0u;
 
     if (IsKernelObject(Handle))
     {
         if (timeout != 0)
         {
             Watchdog::ScopedWait waitGuard("NtWaitForSingleObjectEx", callerLr, Handle, timeout, 0x101u);
+
+            // Protect GuestMain (sub_82586AC0 -> sub_825385B0+0x38, lr=0x825385E8, ctr=0x82586AC0) from hanging
+            // forever on a missed task/media barrier signal when XMV worker threads are stalled or tearing down.
+            if (timeout == INFINITE && callerLr == 0x825385E8u && callerCtr == 0x82586AC0u)
+            {
+                auto* kObj = GetKernelObject(Handle);
+                uint32_t waitedMs = 0;
+                while (true)
+                {
+                    const uint32_t res = kObj->Wait(50);
+                    if (res != STATUS_TIMEOUT)
+                        return res;
+
+                    waitedMs += 50;
+                    if (waitedMs >= 2500)
+                    {
+                        LOGFN_WARNING(
+                            "GuestMain sub_82586AC0 stalled {} ms on handle 0x{:08X}; aborting stalled XMV & releasing barrier.",
+                            waitedMs, Handle);
+                        extern std::atomic<bool> g_xmvAbortRequested;
+                        void XmvForceAbortActivePlayer();
+                        g_xmvAbortRequested.store(true, std::memory_order_release);
+                        XmvForceAbortActivePlayer();
+                        return STATUS_SUCCESS;
+                    }
+                }
+            }
+
             return GetKernelObject(Handle)->Wait(timeout);
         }
         Watchdog::Heartbeat(callerLr);
@@ -808,37 +841,85 @@ uint32_t KeSetAffinityThread(uint32_t Thread, uint32_t Affinity, be<uint32_t>* l
 
 void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
 {
-    cs->RecursionCount = cs->RecursionCount.get() - 1;
-
-    if (cs->RecursionCount.get() != 0)
+    if (cs == nullptr)
         return;
 
+    const int32_t nextRec = cs->RecursionCount.get() - 1;
+    if (nextRec > 0)
+    {
+        cs->RecursionCount = nextRec;
+        return;
+    }
+
+    cs->RecursionCount = 0;
     std::atomic_ref owningThread(cs->OwningThread);
-    owningThread.store(0);
+    owningThread.store(0, std::memory_order_release);
     owningThread.notify_all();
 }
 
 void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
 {
+    if (cs == nullptr)
+        return;
+
     be<uint32_t> thisThread = g_ppcContext->r13.u32;
     assert(thisThread != NULL);
 
     std::atomic_ref owningThread(cs->OwningThread);
 
-    while (true) 
+    // Fast path: uncontended or recursive entry on the same guest thread.
+    be<uint32_t> previousOwner = 0;
+    if (owningThread.compare_exchange_strong(previousOwner, thisThread, std::memory_order_acq_rel) ||
+        previousOwner == thisThread)
     {
-        be<uint32_t> previousOwner = 0;
+        const int32_t curRec = cs->RecursionCount.get();
+        cs->RecursionCount = (curRec > 0 ? curRec : 0) + 1;
+        return;
+    }
 
-        if (owningThread.compare_exchange_weak(previousOwner, thisThread) || previousOwner == thisThread)
+    const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    const uint32_t csAddr = g_memory.IsInMemoryRange(cs) ? g_memory.MapVirtual(cs) : 0u;
+    Watchdog::ScopedWait waitGuard("RtlEnterCriticalSection", callerLr, csAddr, 2000u, 0x100u);
+
+    const auto waitStart = std::chrono::steady_clock::now();
+    uint32_t spins = 0;
+
+    while (true)
+    {
+        previousOwner = 0;
+        if (owningThread.compare_exchange_weak(previousOwner, thisThread, std::memory_order_acq_rel) ||
+            previousOwner == thisThread)
         {
-            cs->RecursionCount = cs->RecursionCount.get() + 1;
+            const int32_t curRec = cs->RecursionCount.get();
+            cs->RecursionCount = (curRec > 0 ? curRec : 0) + 1;
             return;
         }
 
-        const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
-        const uint32_t csAddr = g_memory.IsInMemoryRange(cs) ? g_memory.MapVirtual(cs) : 0u;
-        Watchdog::ScopedWait waitGuard("RtlEnterCriticalSection", callerLr, csAddr, INFINITE, 0x100u);
-        owningThread.wait(previousOwner);
+        // Guard against uninitialized/orphaned XRTL_CRITICAL_SECTION state (e.g. OwningThread is non-zero garbage
+        // outside valid guest memory or RecursionCount <= 0 while OwningThread != 0, or deadlocked > 2000 ms).
+        const uint32_t rawOwner = previousOwner.get();
+        const int32_t rawRec = cs->RecursionCount.get();
+        const auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - waitStart).count();
+
+        if ((waitedMs >= 50 && rawRec <= 0) || waitedMs >= 2000)
+        {
+            LOGFN_WARNING(
+                "RtlEnterCriticalSection recovery at 0x{:08X} (lr=0x{:08X}, stale_owner=0x{:08X}, rec={}, waited={} ms)",
+                csAddr, callerLr, rawOwner, rawRec, waitedMs);
+            if (owningThread.compare_exchange_strong(previousOwner, thisThread, std::memory_order_acq_rel))
+            {
+                cs->RecursionCount = 1;
+                return;
+            }
+        }
+
+        // Never use unbounded owningThread.wait(previousOwner) on Darwin/iOS: when RtlLeaveCriticalSection clears
+        // OwningThread=0 between compare_exchange_weak and ulock_wait, the thread sleeps forever with cs_owner_pcr=0!
+        if (++spins < 128)
+            std::this_thread::yield();
+        else
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
 }
 
@@ -1152,7 +1233,9 @@ bool KeResetEvent(XKEVENT* pEvent)
 // ---------------------------------------------------------------------------------------------------------------------
 std::atomic<bool> g_xmvAbortRequested{ false };
 thread_local uint64_t g_xmvFrameCallStartMs = 0;
-constexpr uint64_t XMV_STALL_LIMIT_MS = 3000;
+constexpr uint64_t XMV_STALL_LIMIT_MS = 2500;
+
+void XmvForceAbortActivePlayer();
 
 uint64_t XmvNowMs()
 {
@@ -1171,6 +1254,8 @@ static uint32_t WaitWithXmvGuard(TWaitable* waitable, uint32_t timeout, uint32_t
     if (timeout != INFINITE || !IsXmvMediaCaller(callerLr))
         return waitable->Wait(timeout);
 
+    const uint64_t ownWaitStartMs = XmvNowMs();
+
     while (true)
     {
         const uint32_t result = waitable->Wait(50);
@@ -1179,12 +1264,22 @@ static uint32_t WaitWithXmvGuard(TWaitable* waitable, uint32_t timeout, uint32_t
             return result;
 
         if (g_xmvAbortRequested.load(std::memory_order_acquire))
-            return STATUS_TIMEOUT;
-
-        if (g_xmvFrameCallStartMs != 0 && XmvNowMs() - g_xmvFrameCallStartMs > XMV_STALL_LIMIT_MS)
         {
-            LOGN_WARNING("XMV: frame decode stalled in KeWaitForSingleObject, aborting movie playback.");
+            XmvForceAbortActivePlayer();
+            return STATUS_TIMEOUT;
+        }
+
+        const uint64_t nowMs = XmvNowMs();
+        const bool frameCallStalled = (g_xmvFrameCallStartMs != 0) && (nowMs - g_xmvFrameCallStartMs > XMV_STALL_LIMIT_MS);
+        const bool workerWaitStalled = (nowMs - ownWaitStartMs > XMV_STALL_LIMIT_MS);
+
+        if (frameCallStalled || workerWaitStalled)
+        {
+            LOGFN_WARNING(
+                "XMV: media wait stalled > {} ms in KeWaitForSingleObject (lr=0x{:08X}), forcing clean XMV abort.",
+                XMV_STALL_LIMIT_MS, callerLr);
             g_xmvAbortRequested.store(true, std::memory_order_release);
+            XmvForceAbortActivePlayer();
             return STATUS_TIMEOUT;
         }
     }

@@ -188,7 +188,17 @@ static void GuestThreadFunc(void* data)
     Watchdog::RegisterCurrentThread(Watchdog::ThreadKind::GuestWorker, threadName.c_str(), hThread->params.function);
     {
         Watchdog::ScopedWait waitGuard("GuestThread::InitialSuspend", hThread->params.function, 0, INFINITE, 0x104u);
-        hThread->suspended.wait(true);
+        while (hThread->suspended.load(std::memory_order_acquire))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            extern std::atomic<bool> g_xmvAbortRequested;
+            if (hThread->params.function >= 0x82742000u && hThread->params.function < 0x82743000u &&
+                g_xmvAbortRequested.load(std::memory_order_acquire))
+            {
+                hThread->suspended.store(false, std::memory_order_release);
+                break;
+            }
+        }
     }
     GuestThread::Start(hThread->params);
     Watchdog::UnregisterCurrentThread();

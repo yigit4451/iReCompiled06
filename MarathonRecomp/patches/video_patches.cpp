@@ -401,15 +401,16 @@ uint32_t NtResumeThread(GuestThreadHandle* hThread, be<uint32_t>* suspendCount);
 
 static constexpr uint32_t XMV_EOF_RESULT = 0x16660026; // XMEDIA_W_EOF = (5734 << 16) | 38
 static constexpr uint32_t XMV_STATE_FINISHED = 7;
-static uint32_t g_xmvAbortedPlayer = 0;
+static std::atomic<uint32_t> g_xmvAbortedPlayer{ 0 };
+static std::atomic<uint32_t> g_activeXmvPlayer{ 0 };
 
 // Track CCalXmvPlayer* passed into CCalXmvPlayer::GetStatus (sub_82733640) so we can mute/quiesce its XAudioSourceVoice
 // before MovieObjectWmv::Update destroys the player on EOF.
-static uint32_t g_lastCalXmvPlayer = 0;
+static std::atomic<uint32_t> g_lastCalXmvPlayer{ 0 };
 
 static void XmvQuiesceCalAudioVoice(uint8_t* base, uint32_t calPlayerAddr)
 {
-    if (calPlayerAddr < 0x10000u)
+    if (base == nullptr || calPlayerAddr < 0x10000u)
         return;
 
     auto* pCalPlayer = reinterpret_cast<CCalXmvPlayer*>(base + calPlayerAddr);
@@ -432,12 +433,13 @@ static void XmvQuiesceCalAudioVoice(uint8_t* base, uint32_t calPlayerAddr)
 
 static void XmvFinishPlayer(uint8_t* base, uint32_t player)
 {
-    if (player < 0x10000u)
+    if (base == nullptr || player < 0x10000u)
         return;
 
     // Quiesce the wrapping CCalXmvPlayer's XAudio voice first so AudioThread never blocks during teardown.
-    if (g_lastCalXmvPlayer != 0)
-        XmvQuiesceCalAudioVoice(base, g_lastCalXmvPlayer);
+    const uint32_t calPlayer = g_lastCalXmvPlayer.load(std::memory_order_relaxed);
+    if (calPlayer != 0)
+        XmvQuiesceCalAudioVoice(base, calPlayer);
 
     // Raise stop bit (0x4) checked by the stream reader / audio feeder / video decoder / audio renderer worker loops
     // (player + 252, 256, 260 in IXMediaXmvPlayer, plus 220, 224, 228 if offset from subobject).
@@ -475,19 +477,42 @@ static void XmvFinishPlayer(uint8_t* base, uint32_t player)
     }
 }
 
+void XmvForceAbortActivePlayer()
+{
+    if (g_memory.base == nullptr)
+        return;
+
+    uint32_t player = g_activeXmvPlayer.load(std::memory_order_acquire);
+    if (player >= 0x10000u)
+    {
+        g_xmvAbortedPlayer.store(player, std::memory_order_release);
+        XmvFinishPlayer(g_memory.base, player);
+    }
+    else
+    {
+        const uint32_t calPlayer = g_lastCalXmvPlayer.load(std::memory_order_relaxed);
+        if (calPlayer >= 0x10000u)
+            XmvQuiesceCalAudioVoice(g_memory.base, calPlayer);
+    }
+}
+
 PPC_FUNC_IMPL(__imp__sub_82743680);
 PPC_FUNC(sub_82743680)
 {
     const uint32_t player = ctx.r3.u32;
+    if (player >= 0x10000u)
+        g_activeXmvPlayer.store(player, std::memory_order_release);
+
+    const uint32_t prevAborted = g_xmvAbortedPlayer.load(std::memory_order_acquire);
 
     // A different player means a new movie started; forget the previous abort cleanly.
-    if (g_xmvAbortedPlayer != 0 && g_xmvAbortedPlayer != player)
+    if (prevAborted != 0 && prevAborted != player)
     {
-        g_xmvAbortedPlayer = 0;
+        g_xmvAbortedPlayer.store(0, std::memory_order_release);
         g_xmvAbortRequested.store(false, std::memory_order_release);
     }
 
-    if (g_xmvAbortedPlayer == player && player != 0)
+    if (g_xmvAbortedPlayer.load(std::memory_order_acquire) == player && player != 0)
     {
         XmvFinishPlayer(base, player);
         ctx.r3.u32 = XMV_EOF_RESULT;
@@ -502,7 +527,7 @@ PPC_FUNC(sub_82743680)
     {
         LOGN_WARNING("XMV: finishing stalled movie playback cleanly (EOF + audio/worker drain).");
 
-        g_xmvAbortedPlayer = player;
+        g_xmvAbortedPlayer.store(player, std::memory_order_release);
         XmvFinishPlayer(base, player);
         // Clear the global abort flag once the stalled player has been transitioned to EOF so subsequent
         // movies or audio streams on the Title Screen are completely unaffected.
@@ -519,15 +544,16 @@ PPC_FUNC(sub_82733640)
     const uint32_t pStatus = ctx.r4.u32;
 
     if (calPlayer >= 0x10000u)
-        g_lastCalXmvPlayer = calPlayer;
+        g_lastCalXmvPlayer.store(calPlayer, std::memory_order_relaxed);
 
-    if (g_xmvAbortedPlayer != 0 && pStatus >= 0x10000u)
+    if (g_xmvAbortedPlayer.load(std::memory_order_acquire) != 0 && pStatus >= 0x10000u)
     {
         XmvQuiesceCalAudioVoice(base, calPlayer);
         *reinterpret_cast<be<uint32_t>*>(base + pStatus) = XMV_STATE_FINISHED;
         // Clear g_xmvAbortedPlayer after reporting FINISHED so MovieObjectWmv::Update tears down this movie
         // once and future movies start fresh.
-        g_xmvAbortedPlayer = 0;
+        g_xmvAbortedPlayer.store(0, std::memory_order_release);
+        g_activeXmvPlayer.store(0, std::memory_order_release);
         ctx.r3.u32 = 0;
         return;
     }
