@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace os::ios
 {
@@ -57,4 +58,14 @@ namespace os::ios
     // Configures CAMetalLayer properties on iOS (maximumDrawableCount = 3, allowsNextDrawableTimeout = YES)
     // so nextDrawable never blocks the Render Thread indefinitely.
     void ConfigureMetalLayer(void* metalLayer);
+
+    // Returns true when the calling thread is the iOS process main thread (com.apple.main-thread).
+    bool IsMainThread();
+
+    // Runs fn on com.apple.main-thread and blocks until it completes (runs inline when already on the main thread).
+    // MarathonMain runs on a background queue, so UIKit work (UIWindow / CAMetalLayer / alerts) must go through this.
+    void RunOnMainThreadSync(const std::function<void()>& fn);
+
+    // Requests landscape-only geometry on every connected UIWindowScene (LandscapeLeft / LandscapeRight).
+    void EnforceLandscapeOrientation();
 }

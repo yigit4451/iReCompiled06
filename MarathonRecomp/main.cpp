@@ -28,6 +28,23 @@
 #include <ui/game_window.h>
 #include <ui/installer_wizard.h>
 #include <mod/mod_loader.h>
+
+#ifdef MARATHON_RECOMP_IOS
+#include <os/ios/memory_ios.h>
+#endif
+
+// UIKit alerts must be presented from com.apple.main-thread; MarathonMain runs on a background queue on iOS.
+static void MarathonShowSimpleMessageBox(SDL_MessageBoxFlags flags, const char* title, const char* message, SDL_Window* window)
+{
+#ifdef MARATHON_RECOMP_IOS
+    const std::string titleCopy = title ? title : "";
+    const std::string messageCopy = message ? message : "";
+    os::ios::RunOnMainThreadSync([&]() { SDL_ShowSimpleMessageBox(flags, titleCopy.c_str(), messageCopy.c_str(), window); });
+#else
+    SDL_ShowSimpleMessageBox(flags, title, message, window);
+#endif
+}
+
 #include <preload_executable.h>
 #include <iostream>
 #include <app.h>
@@ -68,7 +85,7 @@ void KiSystemStartup()
 {
     if (g_memory.base == nullptr)
     {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("System_MemoryAllocationFailed").c_str(), GameWindow::s_pWindow);
+        MarathonShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("System_MemoryAllocationFailed").c_str(), GameWindow::s_pWindow);
         std::_Exit(1);
     }
 
@@ -274,6 +291,33 @@ extern "C" MARATHON_CORE_API bool MarathonIsGameInstalled(void)
     return Installer::checkGameInstall(GetGamePath(), modulePath);
 }
 
+extern "C" MARATHON_CORE_API void MarathonPrepareMainThread(void)
+{
+#ifdef MARATHON_RECOMP_IOS
+    // SDL records the thread that first initialises it as its "main thread" (SDL_IsMainThread / SDL_RunOnMainThread).
+    // Initialise the events subsystem here, on com.apple.main-thread, before MarathonMain starts on a background queue.
+    static bool s_prepared = false;
+    if (s_prepared || !os::ios::IsMainThread())
+        return;
+
+    s_prepared = true;
+    SDL_SetMainReady();
+    SDL_InitSubSystem(SDL_INIT_EVENTS);
+#endif
+}
+
+extern "C" MARATHON_CORE_API void MarathonPumpMainThreadEvents(void)
+{
+#ifdef MARATHON_RECOMP_IOS
+    // Called by the Swift host from a 60 Hz timer on com.apple.main-thread while the engine runs on a background queue.
+    if (GameWindow::s_pWindow == nullptr || !os::ios::IsMainThread())
+        return;
+
+    SDL_PumpEvents();
+    SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+#endif
+}
+
 extern "C" MARATHON_CORE_API int MarathonMain(int argc, char** argv)
 {
 #ifdef _WIN32
@@ -356,7 +400,7 @@ extern "C" MARATHON_CORE_API int MarathonMain(int argc, char** argv)
         {
             char text[512];
             snprintf(text, sizeof(text), Localise("System_Win32_MissingDLLs").c_str(), dll.data());
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), text, GameWindow::s_pWindow);
+            MarathonShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), text, GameWindow::s_pWindow);
             std::_Exit(1);
         }
     }
@@ -386,7 +430,7 @@ extern "C" MARATHON_CORE_API int MarathonMain(int argc, char** argv)
     {
         if (!Video::CreateHostDevice(sdlVideoDriver, graphicsApiRetry))
         {
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("Video_BackendError").c_str(), GameWindow::s_pWindow);
+            MarathonShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("Video_BackendError").c_str(), GameWindow::s_pWindow);
 #if defined(MARATHON_RECOMP_IOS) || defined(MARATHON_CORE_LIBRARY)
             return 1;
 #else
@@ -416,7 +460,7 @@ extern "C" MARATHON_CORE_API int MarathonMain(int argc, char** argv)
     {
         if (!Video::CreateHostDevice(sdlVideoDriver, graphicsApiRetry))
         {
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("Video_BackendError").c_str(), GameWindow::s_pWindow);
+            MarathonShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("Video_BackendError").c_str(), GameWindow::s_pWindow);
 #if defined(MARATHON_RECOMP_IOS) || defined(MARATHON_CORE_LIBRARY)
             return 1;
 #else
@@ -440,7 +484,7 @@ extern "C" MARATHON_CORE_API int MarathonMain(int argc, char** argv)
     {
         const std::string report = GuestGetFatalError();
         SetMarathonLastError(report);
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "iReCompiled06 - Guest Hatasi", report.c_str(), GameWindow::s_pWindow);
+        MarathonShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "iReCompiled06 - Guest Hatasi", report.c_str(), GameWindow::s_pWindow);
         return 3;
     }
 

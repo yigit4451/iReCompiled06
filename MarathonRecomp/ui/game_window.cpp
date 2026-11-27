@@ -234,6 +234,19 @@ bool Window_OnSDLEvent(void*, SDL_Event* event)
 
 void GameWindow::Init(const char* sdlVideoDriver)
 {
+#if defined(__APPLE__) && TARGET_OS_IOS
+    // MarathonMain runs on a background queue; SDL_InitSubSystem(VIDEO) / SDL_CreateWindow / SDL_Metal_CreateView /
+    // SDL_ShowWindow touch UIKit and must execute on com.apple.main-thread.
+    if (!os::ios::IsMainThread())
+    {
+        os::ios::RunOnMainThreadSync([sdlVideoDriver]() { GameWindow::Init(sdlVideoDriver); });
+        return;
+    }
+
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    os::ios::EnforceLandscapeOrientation();
+#endif
+
 #ifdef __linux__
     SDL_SetHint(SDL_HINT_APP_ID, "io.github.sonicnext_dev.marathonrecomp");
 #endif
@@ -265,6 +278,12 @@ void GameWindow::Init(const char* sdlVideoDriver)
 #endif
 
     SetDimensions(Config::WindowWidth, Config::WindowHeight, Config::WindowX, Config::WindowY);
+
+#if defined(__APPLE__) && TARGET_OS_IOS
+    // Keep the initial window in landscape order (width >= height).
+    if (s_width < s_height)
+        std::swap(s_width, s_height);
+#endif
 
     if (!IsPositionValid())
         GameWindow::ResetDimensions();

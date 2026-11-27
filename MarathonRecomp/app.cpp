@@ -7,6 +7,9 @@
 #include <kernel/function.h>
 #include <os/process.h>
 #include <os/logger.h>
+#ifdef MARATHON_RECOMP_IOS
+#include <os/ios/memory_ios.h>
+#endif
 #include <patches/audio_patches.h>
 #include <patches/patches.h>
 #include <ui/game_window.h>
@@ -32,8 +35,15 @@ void App::Update(double in_deltaTime)
 {
     if (HostThread::GetCurrentID() == g_appMainThreadId)
     {
-        SDL_PumpEvents();
-        SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+#ifdef MARATHON_RECOMP_IOS
+        // MarathonMain runs on a background queue on iOS; SDL events are pumped on com.apple.main-thread
+        // through MarathonPumpMainThreadEvents().
+        if (os::ios::IsMainThread())
+#endif
+        {
+            SDL_PumpEvents();
+            SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+        }
 
         GameWindow::Update();
     }

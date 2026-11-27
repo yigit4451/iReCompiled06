@@ -11,6 +11,7 @@
 #include <dispatch/dispatch.h>
 #include <mutex>
 #include <os/proc.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -285,4 +286,57 @@ void os::ios::ConfigureMetalLayer(void* metalLayer)
         caLayer.maximumDrawableCount = 3;
         caLayer.allowsNextDrawableTimeout = YES;
     }
+}
+
+bool os::ios::IsMainThread()
+{
+    return pthread_main_np() != 0;
+}
+
+void os::ios::RunOnMainThreadSync(const std::function<void()>& fn)
+{
+    if (!fn)
+        return;
+
+    if (pthread_main_np() != 0)
+    {
+        fn();
+        return;
+    }
+
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        fn();
+    });
+}
+
+void os::ios::EnforceLandscapeOrientation()
+{
+    void (^apply)(void) = ^{
+        for (UIScene* scene in UIApplication.sharedApplication.connectedScenes)
+        {
+            if (![scene isKindOfClass:[UIWindowScene class]])
+                continue;
+
+            UIWindowScene* windowScene = (UIWindowScene*)scene;
+            UIWindowSceneGeometryPreferencesIOS* prefs =
+                [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:UIInterfaceOrientationMaskLandscape];
+            [windowScene requestGeometryUpdateWithPreferences:prefs errorHandler:^(NSError* error) {
+                (void)error;
+            }];
+        }
+
+        for (UIScene* scene in UIApplication.sharedApplication.connectedScenes)
+        {
+            if (![scene isKindOfClass:[UIWindowScene class]])
+                continue;
+
+            for (UIWindow* window in ((UIWindowScene*)scene).windows)
+                [window.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
+        }
+    };
+
+    if (pthread_main_np() != 0)
+        apply();
+    else
+        dispatch_async(dispatch_get_main_queue(), apply);
 }

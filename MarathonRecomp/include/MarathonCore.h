@@ -22,9 +22,23 @@ extern "C" {
 
 /**
  * Entry point for running MarathonRecomp from an external host (e.g. SwiftUI on iOS).
- * Note: On iOS (UIKit/SDL3), invoke on the main thread after the UIApplication lifecycle starts.
+ * Note: On iOS (UIKit/SDL3), invoke on a background queue (never com.apple.main-thread: the guest blocks in
+ * KeWaitForSingleObject and would trigger the 0x8BADF00D watchdog). The engine dispatches UIKit/SDL window work
+ * to the main thread itself; the host must call MarathonPumpMainThreadEvents() from the main run loop.
  */
 MARATHON_CORE_API int MarathonMain(int argc, char** argv);
+
+/**
+ * iOS: must be called once on com.apple.main-thread before launching MarathonMain on a background queue, so SDL
+ * registers the real main thread as its main thread.
+ */
+MARATHON_CORE_API void MarathonPrepareMainThread(void);
+
+/**
+ * Pumps SDL/UIKit events. Must be called on com.apple.main-thread (e.g. from a 60 Hz timer) while MarathonMain
+ * runs on a background queue. No-op until the SDL window exists or when called off the main thread.
+ */
+MARATHON_CORE_API void MarathonPumpMainThreadEvents(void);
 
 /**
  * Returns the UTF-8 path to the user-accessible Documents directory

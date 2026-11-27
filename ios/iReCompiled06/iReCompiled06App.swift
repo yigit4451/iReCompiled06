@@ -23,6 +23,7 @@ final class MarathonLaunchController {
 
     var phase: Phase = .checkingSandbox
     private var didStartEngine = false
+    @ObservationIgnored private var eventPumpTimer: Timer?
 
     var installDirectoryPath: String {
         guard let rawPtr = GetMarathonInstallDirectory() else {
@@ -33,6 +34,7 @@ final class MarathonLaunchController {
 
     func bootstrapOnLaunch() {
         guard !didStartEngine else { return }
+        Self.requestLandscapeOrientation()
 
         if IsMarathonInstalled() {
             launchMarathonOnMainThread()
@@ -41,28 +43,58 @@ final class MarathonLaunchController {
         }
     }
 
+    /// Requests landscape-only geometry (LandscapeLeft / LandscapeRight) on every connected window scene.
+    static func requestLandscapeOrientation() {
+        for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            windowScene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape)) { _ in }
+        }
+    }
+
+    /// Starts the engine. MarathonMain (and therefore the guest `_xstart` thread) runs on a background queue so
+    /// `com.apple.main-thread` is never blocked by KeWaitForSingleObject (0x8BADF00D watchdog). UIKit / SDL window
+    /// work is dispatched back to the main thread by the engine, and SDL events are pumped by `eventPumpTimer`.
     func launchMarathonOnMainThread() {
         guard !didStartEngine else { return }
         didStartEngine = true
         phase = .runningEngine
 
         UIApplication.shared.isIdleTimerDisabled = true
+        Self.requestLandscapeOrientation()
+        MarathonPrepareMainThread()
+        startEventPump()
 
-        // Dispatch onto the next Main RunLoop turn so the active UIWindowScene is ready
-        // before SDL3 + Metal/MoltenVK creates and promotes its fullscreen window.
-        DispatchQueue.main.async { [weak self] in
-            precondition(Thread.isMainThread, "MarathonMain() must be invoked on the Main Thread.")
-            let exitCode = Self.invokeMarathonMain(arguments: CommandLine.arguments)
-            UIApplication.shared.isIdleTimerDisabled = false
-            if exitCode != 0 {
-                self?.didStartEngine = false
-                let detail = String(cString: MarathonGetLastErrorMessage())
-                self?.phase = .engineExited(exitCode, detail)
+        let arguments = CommandLine.arguments
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let exitCode = Self.invokeMarathonMain(arguments: arguments)
+            let detail = exitCode != 0 ? String(cString: MarathonGetLastErrorMessage()) : ""
+
+            Task { @MainActor [weak self] in
+                self?.stopEventPump()
+                UIApplication.shared.isIdleTimerDisabled = false
+                if exitCode != 0 {
+                    self?.didStartEngine = false
+                    self?.phase = .engineExited(exitCode, detail)
+                }
             }
         }
     }
 
-    private static func invokeMarathonMain(arguments: [String]) -> Int32 {
+    private func startEventPump() {
+        guard eventPumpTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { _ in
+            MarathonPumpMainThreadEvents()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        eventPumpTimer = timer
+    }
+
+    private func stopEventPump() {
+        eventPumpTimer?.invalidate()
+        eventPumpTimer = nil
+    }
+
+    nonisolated private static func invokeMarathonMain(arguments: [String]) -> Int32 {
         let safeArgs = arguments.isEmpty ? ["iReCompiled06"] : arguments
         var cStrings: [UnsafeMutablePointer<CChar>?] = safeArgs.map { strdup($0) }
         cStrings.append(nil)

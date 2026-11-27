@@ -2589,7 +2589,9 @@ void Video::Present()
     // During standalone intro/WMV playback loops, DocMarathonState::Update may not run every frame;
     // pump SDL events on the main thread right here so touch-to-skip (Start/A) and lifecycle events
     // are processed with zero frame latency.
-    if (HostThread::GetCurrentID() == g_mainThreadId)
+    // MarathonMain runs on a background queue on iOS, so SDL (UIKit) events are pumped on
+    // com.apple.main-thread by MarathonPumpMainThreadEvents() instead of here.
+    if (os::ios::IsMainThread() && HostThread::GetCurrentID() == g_mainThreadId)
     {
         SDL_PumpEvents();
         SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);

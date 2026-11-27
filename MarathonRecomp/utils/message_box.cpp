@@ -3,6 +3,9 @@
 #include <SDL3/SDL.h>
 #include <ui/game_window.h>
 #include <vector>
+#ifdef MARATHON_RECOMP_IOS
+#include <os/ios/memory_ios.h>
+#endif
 
 struct MessageBoxData
 {
@@ -12,7 +15,7 @@ struct MessageBoxData
     int* choiceOut;
 };
 
-static void ShowMessageBox(void* data)
+static void ShowMessageBoxImpl(void* data)
 {
     const auto* msgData = static_cast<const MessageBoxData*>(data);
 
@@ -31,6 +34,16 @@ static void ShowMessageBox(void* data)
     }
     else
         SDL_ShowSimpleMessageBox(msgData->flags, GameWindow::GetTitle(), msgData->message->c_str(), GameWindow::s_pWindow);
+}
+
+static void ShowMessageBox(void* data)
+{
+#ifdef MARATHON_RECOMP_IOS
+    // UIKit alerts must run on com.apple.main-thread; the engine runs on a background queue on iOS.
+    os::ios::RunOnMainThreadSync([data]() { ShowMessageBoxImpl(data); });
+#else
+    ShowMessageBoxImpl(data);
+#endif
 }
 
 void SimpleMessageBox::Show(MessageType type, const std::string& message)

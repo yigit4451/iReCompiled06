@@ -2,9 +2,11 @@
 #include <gpu/render_resolution.h>
 #include <gpu/video.h>
 #include <kernel/memory.h>
+#include <kernel/xdm.h>
 #include <os/logger.h>
 #include <user/config.h>
 #include <app.h>
+#include <atomic>
 
 const char* g_pBlockName{};
 
@@ -381,3 +383,93 @@ static int ScreenShaderInit(be<uint32_t>* a1)
 }
 
 GUEST_FUNCTION_HOOK(sub_82736178, ScreenShaderInit);
+
+// ---------------------------------------------------------------------------------------------------------------------
+// XMV / Criware movie player stall guard (SONIC TEAM logo -> opening movie).
+//
+// sub_82743680 is the XMV "get next frame" call made by Sonicteam::MovieObjectWmv::Update (sub_8264C8D0). Its worker
+// threads (0x827422F8..0x82742388) and the XAudio callback can lock each other up, leaving the game thread in an
+// infinite KeWaitForSingleObject. KeWaitForSingleObject (imports.cpp) slices waits made from the XMV code range and
+// aborts them once this call has stalled for XMV_STALL_LIMIT_MS; this hook then finishes the movie cleanly by
+// raising the player's stop bits, waking its internal events and reporting XMEDIA_W_EOF / state 7 (Finished), so the
+// game advances to the title screen instead of hanging.
+// ---------------------------------------------------------------------------------------------------------------------
+extern std::atomic<bool> g_xmvAbortRequested;
+extern thread_local uint64_t g_xmvFrameCallStartMs;
+uint64_t XmvNowMs();
+bool KeSetEvent(XKEVENT* pEvent, uint32_t Increment, bool Wait);
+
+static constexpr uint32_t XMV_EOF_RESULT = 0x16660026; // XMEDIA_W_EOF = (5734 << 16) | 38
+static constexpr uint32_t XMV_STATE_FINISHED = 7;
+static uint32_t g_xmvAbortedPlayer = 0;
+
+static void XmvFinishPlayer(uint8_t* base, uint32_t player)
+{
+    if (!player)
+        return;
+
+    // Stop bit (0x4) checked by the stream reader / audio feeder / video decoder worker loops.
+    for (const uint32_t offset : { 220u, 224u, 228u })
+    {
+        auto* flags = reinterpret_cast<be<uint32_t>*>(base + player + offset);
+        *flags = flags->get() | 0x4u;
+    }
+
+    // Wake every internal auto-reset event (+84..+196, 16-byte stride) so blocked workers observe the stop bits.
+    for (uint32_t offset = 84; offset <= 196; offset += 16)
+    {
+        auto* event = reinterpret_cast<XKEVENT*>(base + player + offset);
+
+        if (event->Header.Type == 0 || event->Header.Type == 1)
+            KeSetEvent(event, 0, false);
+    }
+}
+
+PPC_FUNC_IMPL(__imp__sub_82743680);
+PPC_FUNC(sub_82743680)
+{
+    const uint32_t player = ctx.r3.u32;
+
+    // A different player means a new movie started; forget the previous abort.
+    if (g_xmvAbortedPlayer != 0 && g_xmvAbortedPlayer != player)
+    {
+        g_xmvAbortedPlayer = 0;
+        g_xmvAbortRequested.store(false, std::memory_order_release);
+    }
+
+    if (g_xmvAbortedPlayer == player && player != 0)
+    {
+        ctx.r3.u32 = XMV_EOF_RESULT;
+        return;
+    }
+
+    g_xmvFrameCallStartMs = XmvNowMs();
+    __imp__sub_82743680(ctx, base);
+    g_xmvFrameCallStartMs = 0;
+
+    if (g_xmvAbortRequested.load(std::memory_order_acquire))
+    {
+        LOGN_WARNING("XMV: finishing stalled movie playback (EOF).");
+
+        g_xmvAbortedPlayer = player;
+        XmvFinishPlayer(base, player);
+        ctx.r3.u32 = XMV_EOF_RESULT;
+    }
+}
+
+// XMV playback status query used by MovieObjectWmv::Update (status 7 => finished, player is destroyed).
+PPC_FUNC_IMPL(__imp__sub_82733640);
+PPC_FUNC(sub_82733640)
+{
+    const uint32_t player = ctx.r3.u32;
+    const uint32_t pStatus = ctx.r4.u32;
+
+    if (g_xmvAbortedPlayer != 0 && g_xmvAbortedPlayer == player && pStatus != 0)
+    {
+        *reinterpret_cast<be<uint32_t>*>(base + pStatus) = XMV_STATE_FINISHED;
+        ctx.r3.u32 = 0;
+        return;
+    }
+
+    __imp__sub_82733640(ctx, base);
+}

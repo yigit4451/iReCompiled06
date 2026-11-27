@@ -3,6 +3,9 @@
 #include "render_command.h"
 #include "vertex_declaration.h"
 #include "video_internal.h"
+#ifdef MARATHON_RECOMP_IOS
+#include <os/ios/memory_ios.h>
+#endif
 
 #include <app.h>
 #include <cpu/guest_thread.h>
@@ -59,8 +62,14 @@ public:
         {
             // Pump SDL events to prevent the OS
             // from thinking the process is unresponsive.
-            SDL_PumpEvents();
-            SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+#ifdef MARATHON_RECOMP_IOS
+            // SDL events are pumped on com.apple.main-thread on iOS (MarathonPumpMainThreadEvents).
+            if (os::ios::IsMainThread())
+#endif
+            {
+                SDL_PumpEvents();
+                SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+            }
 
             g_compilingPipelineTaskCount.wait(value);
         }

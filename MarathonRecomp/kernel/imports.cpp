@@ -1143,6 +1143,53 @@ bool KeResetEvent(XKEVENT* pEvent)
     return QueryKernelObject<Event>(*pEvent)->Reset();
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// XMV / Criware movie player (guest code range 0x82733000..0x82746000) deadlock guard.
+// After the SONIC TEAM logo the XMV worker threads and Sonicteam::MovieObjectWmv::Update (sub_82743680) can end up in an
+// infinite KeWaitForSingleObject cycle. The waits are sliced; once the frame call has stalled for XMV_STALL_LIMIT_MS (or
+// an abort was requested by the sub_82743680 hook) the waits return STATUS_TIMEOUT so the player threads re-check the
+// stop bits that the hook sets and the movie is finished cleanly.
+// ---------------------------------------------------------------------------------------------------------------------
+std::atomic<bool> g_xmvAbortRequested{ false };
+thread_local uint64_t g_xmvFrameCallStartMs = 0;
+constexpr uint64_t XMV_STALL_LIMIT_MS = 3000;
+
+uint64_t XmvNowMs()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+static bool IsXmvMediaCaller(uint32_t callerLr)
+{
+    return callerLr >= 0x82733000u && callerLr < 0x82746000u;
+}
+
+template<typename TWaitable>
+static uint32_t WaitWithXmvGuard(TWaitable* waitable, uint32_t timeout, uint32_t callerLr)
+{
+    if (timeout != INFINITE || !IsXmvMediaCaller(callerLr))
+        return waitable->Wait(timeout);
+
+    while (true)
+    {
+        const uint32_t result = waitable->Wait(50);
+
+        if (result != STATUS_TIMEOUT)
+            return result;
+
+        if (g_xmvAbortRequested.load(std::memory_order_acquire))
+            return STATUS_TIMEOUT;
+
+        if (g_xmvFrameCallStartMs != 0 && XmvNowMs() - g_xmvFrameCallStartMs > XMV_STALL_LIMIT_MS)
+        {
+            LOGN_WARNING("XMV: frame decode stalled in KeWaitForSingleObject, aborting movie playback.");
+            g_xmvAbortRequested.store(true, std::memory_order_release);
+            return STATUS_TIMEOUT;
+        }
+    }
+}
+
 uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, uint32_t WaitMode, bool Alertable, be<int64_t>* Timeout)
 {
     if (Object == nullptr)
@@ -1158,10 +1205,10 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, 
     {
         case 0:
         case 1:
-            return QueryKernelObject<Event>(*Object)->Wait(timeout);
+            return WaitWithXmvGuard(QueryKernelObject<Event>(*Object), timeout, callerLr);
 
         case 5:
-            return QueryKernelObject<Semaphore>(*Object)->Wait(timeout);
+            return WaitWithXmvGuard(QueryKernelObject<Semaphore>(*Object), timeout, callerLr);
 
         default:
             assert(false && "Unrecognized kernel object type.");
@@ -1507,11 +1554,16 @@ uint32_t NtClearEvent(Event* handle, uint32_t* previousState)
     return 0;
 }
 
-uint32_t NtResumeThread(GuestThreadHandle* hThread, uint32_t* suspendCount)
+uint32_t NtResumeThread(GuestThreadHandle* hThread, be<uint32_t>* suspendCount)
 {
     assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE));
 
-    hThread->suspended = false;
+    // Callers (e.g. sub_826FD180) read the previous suspend count back from their stack; never leave it uninitialised.
+    const bool wasSuspended = hThread->suspended.exchange(false);
+
+    if (suspendCount != nullptr)
+        *suspendCount = wasSuspended ? 1u : 0u;
+
     hThread->suspended.notify_all();
 
     return S_OK;
@@ -1917,9 +1969,9 @@ uint32_t KeResumeThread(GuestThreadHandle* object)
 {
     assert(object != GetKernelObject(CURRENT_THREAD_HANDLE));
 
-    object->suspended = false;
+    const bool wasSuspended = object->suspended.exchange(false);
     object->suspended.notify_all();
-    return 0;
+    return wasSuspended ? 1 : 0;
 }
 
 void KeInitializeSemaphore(XKSEMAPHORE* semaphore, uint32_t count, uint32_t limit)
