@@ -420,7 +420,7 @@ static void XmvFinishPlayer(uint8_t* base, uint32_t player)
     {
         auto* event = reinterpret_cast<XKEVENT*>(base + player + offset);
 
-        if (event->Header.Type == 0 || event->Header.Type == 1)
+        if (event->Type == 0 || event->Type == 1)
             KeSetEvent(event, 0, false);
     }
 }
