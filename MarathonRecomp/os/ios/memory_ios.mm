@@ -9,6 +9,7 @@
 #import <UIKit/UIKit.h>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <dispatch/dispatch.h>
 #include <mutex>
@@ -345,22 +346,49 @@ void os::ios::EnforceLandscapeOrientation()
 
 namespace
 {
+    enum TouchButtonIndex : int
+    {
+        kBtnDpadUp = 0,
+        kBtnDpadDown,
+        kBtnDpadLeft,
+        kBtnDpadRight,
+        kBtnA,
+        kBtnB,
+        kBtnX,
+        kBtnY,
+        kBtnLB,
+        kBtnRB,
+        kBtnLT,
+        kBtnRT,
+        kBtnBack,
+        kBtnStart,
+        kBtnCount
+    };
+
     struct TouchPadButtonSpec
     {
         const char* label;
-        SDL_GamepadButton sdlButton;
+        SDL_GamepadButton sdlButton; // SDL_GAMEPAD_BUTTON_INVALID for analog-trigger buttons (LT/RT)
         uint16_t xamMask;
+        bool isTrigger;
     };
 
-    constexpr TouchPadButtonSpec kTouchPadButtons[7] =
+    constexpr TouchPadButtonSpec kTouchPadButtons[kBtnCount] =
     {
-        { "▲",     SDL_GAMEPAD_BUTTON_DPAD_UP,    XAMINPUT_GAMEPAD_DPAD_UP },
-        { "▼",     SDL_GAMEPAD_BUTTON_DPAD_DOWN,  XAMINPUT_GAMEPAD_DPAD_DOWN },
-        { "◀",     SDL_GAMEPAD_BUTTON_DPAD_LEFT,  XAMINPUT_GAMEPAD_DPAD_LEFT },
-        { "▶",     SDL_GAMEPAD_BUTTON_DPAD_RIGHT, XAMINPUT_GAMEPAD_DPAD_RIGHT },
-        { "START", SDL_GAMEPAD_BUTTON_START,      XAMINPUT_GAMEPAD_START },
-        { "A",     SDL_GAMEPAD_BUTTON_SOUTH,      XAMINPUT_GAMEPAD_A },
-        { "B",     SDL_GAMEPAD_BUTTON_EAST,       XAMINPUT_GAMEPAD_B }
+        { "▲",     SDL_GAMEPAD_BUTTON_DPAD_UP,        XAMINPUT_GAMEPAD_DPAD_UP,        false },
+        { "▼",     SDL_GAMEPAD_BUTTON_DPAD_DOWN,      XAMINPUT_GAMEPAD_DPAD_DOWN,      false },
+        { "◀",     SDL_GAMEPAD_BUTTON_DPAD_LEFT,      XAMINPUT_GAMEPAD_DPAD_LEFT,      false },
+        { "▶",     SDL_GAMEPAD_BUTTON_DPAD_RIGHT,     XAMINPUT_GAMEPAD_DPAD_RIGHT,     false },
+        { "A",     SDL_GAMEPAD_BUTTON_SOUTH,          XAMINPUT_GAMEPAD_A,              false },
+        { "B",     SDL_GAMEPAD_BUTTON_EAST,           XAMINPUT_GAMEPAD_B,              false },
+        { "X",     SDL_GAMEPAD_BUTTON_WEST,           XAMINPUT_GAMEPAD_X,              false },
+        { "Y",     SDL_GAMEPAD_BUTTON_NORTH,          XAMINPUT_GAMEPAD_Y,              false },
+        { "LB",    SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,  XAMINPUT_GAMEPAD_LEFT_SHOULDER,  false },
+        { "RB",    SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, XAMINPUT_GAMEPAD_RIGHT_SHOULDER, false },
+        { "LT",    SDL_GAMEPAD_BUTTON_INVALID,        0,                               true  },
+        { "RT",    SDL_GAMEPAD_BUTTON_INVALID,        0,                               true  },
+        { "BACK",  SDL_GAMEPAD_BUTTON_BACK,           XAMINPUT_GAMEPAD_BACK,           false },
+        { "START", SDL_GAMEPAD_BUTTON_START,          XAMINPUT_GAMEPAD_START,          false }
     };
 
     SDL_JoystickID g_virtualJoystickId = 0;
@@ -376,18 +404,27 @@ namespace
         desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
         desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
         desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        desc.axis_mask =
+            (1u << SDL_GAMEPAD_AXIS_LEFTX) |
+            (1u << SDL_GAMEPAD_AXIS_LEFTY) |
+            (1u << SDL_GAMEPAD_AXIS_RIGHTX) |
+            (1u << SDL_GAMEPAD_AXIS_RIGHTY) |
+            (1u << SDL_GAMEPAD_AXIS_LEFT_TRIGGER) |
+            (1u << SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
         desc.button_mask =
             (1u << SDL_GAMEPAD_BUTTON_SOUTH) |
             (1u << SDL_GAMEPAD_BUTTON_EAST) |
             (1u << SDL_GAMEPAD_BUTTON_WEST) |
             (1u << SDL_GAMEPAD_BUTTON_NORTH) |
-            (1u << SDL_GAMEPAD_BUTTON_START) |
             (1u << SDL_GAMEPAD_BUTTON_BACK) |
+            (1u << SDL_GAMEPAD_BUTTON_START) |
+            (1u << SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) |
+            (1u << SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) |
             (1u << SDL_GAMEPAD_BUTTON_DPAD_UP) |
             (1u << SDL_GAMEPAD_BUTTON_DPAD_DOWN) |
             (1u << SDL_GAMEPAD_BUTTON_DPAD_LEFT) |
             (1u << SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
-        desc.name = "iReCompiled06 Touch Gamepad";
+        desc.name = "iReCompiled06 Xbox 360 Touch Controller";
 
         g_virtualJoystickId = SDL_AttachVirtualJoystick(&desc);
         if (g_virtualJoystickId != 0)
@@ -396,6 +433,9 @@ namespace
 
     void EmitTouchGamepadButtonTransition(SDL_GamepadButton sdlBtn, bool down)
     {
+        if (sdlBtn == SDL_GAMEPAD_BUTTON_INVALID)
+            return;
+
         EnsureVirtualGamepadAttached();
 
         if (g_virtualJoystick != nullptr)
@@ -413,6 +453,33 @@ namespace
             SDL_PushEvent(&ev);
         }
     }
+
+    void EmitTouchGamepadAxis(SDL_GamepadAxis axis, Sint16 value)
+    {
+        EnsureVirtualGamepadAttached();
+
+        if (g_virtualJoystick != nullptr)
+        {
+            SDL_SetJoystickVirtualAxis(g_virtualJoystick, static_cast<int>(axis), value);
+        }
+        else
+        {
+            SDL_Event ev{};
+            ev.type = SDL_EVENT_GAMEPAD_AXIS_MOTION;
+            ev.gaxis.timestamp = SDL_GetTicksNS();
+            ev.gaxis.which = g_virtualJoystickId != 0 ? g_virtualJoystickId : 1;
+            ev.gaxis.axis = static_cast<Uint8>(axis);
+            ev.gaxis.value = value;
+            SDL_PushEvent(&ev);
+        }
+    }
+
+    int16_t ClampFloatToInt16(CGFloat normalized)
+    {
+        const CGFloat clamped = std::clamp<CGFloat>(normalized, -1.0, 1.0);
+        const int scaled = static_cast<int>(std::lround(clamped * 32767.0));
+        return static_cast<int16_t>(std::clamp(scaled, -32767, 32767));
+    }
 }
 
 @interface MarathonTouchOverlayView : UIView
@@ -420,10 +487,34 @@ namespace
 
 @implementation MarathonTouchOverlayView
 {
-    UIView* _buttonViews[7];
-    UILabel* _buttonLabels[7];
-    uint16_t _pressedMask;
-    NSMutableSet<UITouch*>* _activeTouches;
+    UIView* _controlsContainer;
+    UIView* _buttonViews[kBtnCount];
+    UILabel* _buttonLabels[kBtnCount];
+    bool _buttonDown[kBtnCount];
+
+    UIView* _leftStickBase;
+    UIView* _leftStickKnob;
+    CGPoint _leftStickRestCenter;
+    CGFloat _leftStickRadius;
+    UITouch* _leftStickTouch;
+    CGPoint _leftStickOrigin;
+
+    UITouch* _rightLookTouch;
+    CGPoint _rightLookOrigin;
+
+    UIView* _toggleButtonView;
+    UILabel* _toggleButtonLabel;
+    UITouch* _toggleTouch;
+    BOOL _controlsHidden;
+
+    NSMutableSet<UITouch*>* _buttonTouches;
+
+    int16_t _lastSdlLX;
+    int16_t _lastSdlLY;
+    int16_t _lastSdlRX;
+    int16_t _lastSdlRY;
+    int16_t _lastSdlLT;
+    int16_t _lastSdlRT;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -436,55 +527,171 @@ namespace
         self.multipleTouchEnabled = YES;
         self.userInteractionEnabled = YES;
         self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        _pressedMask = 0;
-        _activeTouches = [NSMutableSet set];
 
-        for (int i = 0; i < 7; ++i)
+        // IMPORTANT (MRC / Non-ARC): Use alloc+init so the set has +1 retain count and is never autoreleased
+        // at the end of the installation @autoreleasepool (which previously caused recycled-address crashes in addObject:).
+        _buttonTouches = [[NSMutableSet alloc] init];
+        _controlsHidden = NO;
+        _leftStickTouch = nil;
+        _rightLookTouch = nil;
+        _toggleTouch = nil;
+        _leftStickRadius = 52.0;
+
+        _controlsContainer = [[UIView alloc] initWithFrame:self.bounds];
+        _controlsContainer.backgroundColor = [UIColor clearColor];
+        _controlsContainer.opaque = NO;
+        _controlsContainer.userInteractionEnabled = NO;
+        _controlsContainer.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [self addSubview:_controlsContainer];
+#if !__has_feature(objc_arc)
+        [_controlsContainer release];
+#endif
+
+        // Virtual Left Analog Stick (base ring + movable thumb knob)
+        _leftStickBase = [[UIView alloc] initWithFrame:CGRectZero];
+        _leftStickBase.userInteractionEnabled = NO;
+        _leftStickBase.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.28];
+        _leftStickBase.layer.borderWidth = 1.5;
+        _leftStickBase.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.38].CGColor;
+        [_controlsContainer addSubview:_leftStickBase];
+#if !__has_feature(objc_arc)
+        [_leftStickBase release];
+#endif
+
+        _leftStickKnob = [[UIView alloc] initWithFrame:CGRectZero];
+        _leftStickKnob.userInteractionEnabled = NO;
+        _leftStickKnob.backgroundColor = [UIColor colorWithWhite:0.92 alpha:0.42];
+        _leftStickKnob.layer.borderWidth = 1.5;
+        _leftStickKnob.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.65].CGColor;
+        [_controlsContainer addSubview:_leftStickKnob];
+#if !__has_feature(objc_arc)
+        [_leftStickKnob release];
+#endif
+
+        // Discrete Xbox 360 buttons (D-Pad, ABXY, LB/RB, LT/RT, BACK/START)
+        for (int i = 0; i < kBtnCount; ++i)
         {
+            _buttonDown[i] = false;
+
             UIView* btn = [[UIView alloc] initWithFrame:CGRectZero];
             btn.userInteractionEnabled = NO;
-            btn.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.36];
+            btn.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.34];
             btn.layer.borderWidth = 1.5;
 
-            if (i == 5) // A (green)
-                btn.layer.borderColor = [UIColor colorWithRed:0.25 green:0.95 blue:0.45 alpha:0.65].CGColor;
-            else if (i == 6) // B (red)
-                btn.layer.borderColor = [UIColor colorWithRed:0.98 green:0.32 blue:0.32 alpha:0.65].CGColor;
-            else if (i == 4) // START (cyan)
-                btn.layer.borderColor = [UIColor colorWithRed:0.35 green:0.85 blue:1.00 alpha:0.65].CGColor;
+            if (i == kBtnA) // Xbox Green
+                btn.layer.borderColor = [UIColor colorWithRed:0.25 green:0.95 blue:0.42 alpha:0.72].CGColor;
+            else if (i == kBtnB) // Xbox Red
+                btn.layer.borderColor = [UIColor colorWithRed:0.98 green:0.30 blue:0.30 alpha:0.72].CGColor;
+            else if (i == kBtnX) // Xbox Blue
+                btn.layer.borderColor = [UIColor colorWithRed:0.28 green:0.62 blue:1.00 alpha:0.72].CGColor;
+            else if (i == kBtnY) // Xbox Yellow
+                btn.layer.borderColor = [UIColor colorWithRed:1.00 green:0.84 blue:0.22 alpha:0.72].CGColor;
+            else if (i == kBtnStart || i == kBtnBack)
+                btn.layer.borderColor = [UIColor colorWithRed:0.75 green:0.85 blue:0.95 alpha:0.55].CGColor;
             else
-                btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.45].CGColor;
+                btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.44].CGColor;
+
+            CGFloat fontSize = 16.0;
+            if (i >= kBtnA && i <= kBtnY)
+                fontSize = 18.0;
+            else if (i == kBtnBack || i == kBtnStart)
+                fontSize = 11.0;
+            else if (i >= kBtnLB && i <= kBtnRT)
+                fontSize = 13.0;
+            else
+                fontSize = 14.0;
 
             UILabel* lbl = [[UILabel alloc] initWithFrame:CGRectZero];
             lbl.text = [NSString stringWithUTF8String:kTouchPadButtons[i].label];
             lbl.textAlignment = NSTextAlignmentCenter;
-            lbl.textColor = [UIColor colorWithWhite:1.0 alpha:0.85];
-            lbl.font = [UIFont boldSystemFontOfSize:(i == 4 ? 13.0 : 19.0)];
+            lbl.textColor = [UIColor colorWithWhite:1.0 alpha:0.86];
+            lbl.font = [UIFont boldSystemFontOfSize:fontSize];
             [btn addSubview:lbl];
 
-            [self addSubview:btn];
+            [_controlsContainer addSubview:btn];
             _buttonViews[i] = btn;
             _buttonLabels[i] = lbl;
+
+#if !__has_feature(objc_arc)
+            [lbl release];
+            [btn release];
+#endif
         }
+
+        // Bottom-left hide/show toggle button (">>" / "<<")
+        _toggleButtonView = [[UIView alloc] initWithFrame:CGRectZero];
+        _toggleButtonView.userInteractionEnabled = NO;
+        _toggleButtonView.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.38];
+        _toggleButtonView.layer.borderWidth = 1.2;
+        _toggleButtonView.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.45].CGColor;
+
+        _toggleButtonLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+        _toggleButtonLabel.text = @">>";
+        _toggleButtonLabel.textAlignment = NSTextAlignmentCenter;
+        _toggleButtonLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.85];
+        _toggleButtonLabel.font = [UIFont boldSystemFontOfSize:12.0];
+        [_toggleButtonView addSubview:_toggleButtonLabel];
+        [self addSubview:_toggleButtonView];
+
+#if !__has_feature(objc_arc)
+        [_toggleButtonLabel release];
+        [_toggleButtonView release];
+#endif
     }
     return self;
 }
+
+#if !__has_feature(objc_arc)
+- (void)dealloc
+{
+    [_buttonTouches release];
+    _buttonTouches = nil;
+    [super dealloc];
+}
+#endif
 
 - (void)layoutSubviews
 {
     [super layoutSubviews];
 
+    _controlsContainer.frame = self.bounds;
+
     const CGRect bounds = self.bounds;
     const UIEdgeInsets safe = self.safeAreaInsets;
-    const CGFloat leftPad = MAX(safe.left, 18.0) + 12.0;
-    const CGFloat rightPad = MAX(safe.right, 18.0) + 16.0;
-    const CGFloat bottomPad = MAX(safe.bottom, 14.0) + 14.0;
+    const CGFloat leftPad = MAX(safe.left, 16.0) + 10.0;
+    const CGFloat rightPad = MAX(safe.right, 16.0) + 12.0;
+    const CGFloat topPad = MAX(safe.top, 10.0) + 8.0;
+    const CGFloat bottomPad = MAX(safe.bottom, 10.0) + 10.0;
 
-    // Bottom-left D-Pad cross
-    const CGFloat dpadSize = 48.0;
-    const CGFloat dpadStep = 50.0;
-    const CGFloat dpadCenterX = leftPad + dpadStep + dpadSize * 0.5;
-    const CGFloat dpadCenterY = bounds.size.height - bottomPad - dpadStep - dpadSize * 0.5;
+    // 1. Hide/Show toggle button (bottom-left corner ">>")
+    const CGFloat toggleW = 36.0;
+    const CGFloat toggleH = 26.0;
+    _toggleButtonView.frame = CGRectMake(MAX(safe.left, 8.0) + 4.0, bounds.size.height - MAX(safe.bottom, 6.0) - toggleH - 4.0, toggleW, toggleH);
+    _toggleButtonView.layer.cornerRadius = toggleH * 0.5;
+    _toggleButtonLabel.frame = _toggleButtonView.bounds;
+
+    // 2. Bottom-left Left Analog Stick
+    _leftStickRadius = 52.0;
+    const CGFloat stickDiameter = _leftStickRadius * 2.0;
+    const CGFloat knobDiameter = 46.0;
+    const CGFloat stickCenterX = leftPad + _leftStickRadius + 24.0;
+    const CGFloat stickCenterY = bounds.size.height - bottomPad - _leftStickRadius - 18.0;
+    _leftStickRestCenter = CGPointMake(stickCenterX, stickCenterY);
+
+    _leftStickBase.frame = CGRectMake(stickCenterX - _leftStickRadius, stickCenterY - _leftStickRadius, stickDiameter, stickDiameter);
+    _leftStickBase.layer.cornerRadius = _leftStickRadius;
+
+    if (_leftStickTouch == nil)
+    {
+        _leftStickKnob.frame = CGRectMake(stickCenterX - knobDiameter * 0.5, stickCenterY - knobDiameter * 0.5, knobDiameter, knobDiameter);
+    }
+    _leftStickKnob.layer.cornerRadius = knobDiameter * 0.5;
+
+    // 3. Compact D-Pad above Left Analog Stick
+    const CGFloat dpadSize = 34.0;
+    const CGFloat dpadStep = 34.0;
+    const CGFloat dpadCenterX = leftPad + dpadStep + dpadSize * 0.5 + 8.0;
+    const CGFloat dpadCenterY = stickCenterY - _leftStickRadius - dpadStep - dpadSize * 0.5 - 14.0;
 
     const CGPoint dpadCenters[4] =
     {
@@ -496,112 +703,358 @@ namespace
 
     for (int i = 0; i < 4; ++i)
     {
-        CGRect f = CGRectMake(dpadCenters[i].x - dpadSize * 0.5, dpadCenters[i].y - dpadSize * 0.5, dpadSize, dpadSize);
-        _buttonViews[i].frame = f;
-        _buttonViews[i].layer.cornerRadius = 12.0;
+        _buttonViews[i].frame = CGRectMake(dpadCenters[i].x - dpadSize * 0.5, dpadCenters[i].y - dpadSize * 0.5, dpadSize, dpadSize);
+        _buttonViews[i].layer.cornerRadius = 9.0;
         _buttonLabels[i].frame = _buttonViews[i].bounds;
     }
 
-    // Bottom-right Start, A, B buttons
-    const CGFloat abSize = 58.0;
-    const CGFloat bCenterX = bounds.size.width - rightPad - abSize * 0.5;
-    const CGFloat bCenterY = bounds.size.height - bottomPad - abSize * 0.5 - 38.0;
-    const CGFloat aCenterX = bCenterX - 66.0;
-    const CGFloat aCenterY = bounds.size.height - bottomPad - abSize * 0.5 + 4.0;
+    // 4. Bottom-right Xbox 360 ABXY diamond: A (bottom), B (right), X (left), Y (top)
+    const CGFloat abxySize = 50.0;
+    const CGFloat diamondRadius = 48.0;
+    const CGFloat diamondCenterX = bounds.size.width - rightPad - diamondRadius - abxySize * 0.5 - 8.0;
+    const CGFloat diamondCenterY = bounds.size.height - bottomPad - diamondRadius - abxySize * 0.5 - 16.0;
 
-    _buttonViews[5].frame = CGRectMake(aCenterX - abSize * 0.5, aCenterY - abSize * 0.5, abSize, abSize);
-    _buttonViews[5].layer.cornerRadius = abSize * 0.5;
-    _buttonLabels[5].frame = _buttonViews[5].bounds;
+    const CGPoint abxyCenters[4] =
+    {
+        CGPointMake(diamondCenterX, diamondCenterY + diamondRadius), // A (South / bottom)
+        CGPointMake(diamondCenterX + diamondRadius, diamondCenterY), // B (East / right)
+        CGPointMake(diamondCenterX - diamondRadius, diamondCenterY), // X (West / left)
+        CGPointMake(diamondCenterX, diamondCenterY - diamondRadius)  // Y (North / top)
+    };
 
-    _buttonViews[6].frame = CGRectMake(bCenterX - abSize * 0.5, bCenterY - abSize * 0.5, abSize, abSize);
-    _buttonViews[6].layer.cornerRadius = abSize * 0.5;
-    _buttonLabels[6].frame = _buttonViews[6].bounds;
+    for (int idx = 0; idx < 4; ++idx)
+    {
+        const int btnIdx = kBtnA + idx;
+        _buttonViews[btnIdx].frame = CGRectMake(abxyCenters[idx].x - abxySize * 0.5, abxyCenters[idx].y - abxySize * 0.5, abxySize, abxySize);
+        _buttonViews[btnIdx].layer.cornerRadius = abxySize * 0.5;
+        _buttonLabels[btnIdx].frame = _buttonViews[btnIdx].bounds;
+    }
 
-    const CGFloat startW = 78.0;
-    const CGFloat startH = 36.0;
-    const CGFloat startX = aCenterX - 96.0 - startW * 0.5;
-    const CGFloat startY = bounds.size.height - bottomPad - startH - 4.0;
-    _buttonViews[4].frame = CGRectMake(startX, startY, startW, startH);
-    _buttonViews[4].layer.cornerRadius = startH * 0.5;
-    _buttonLabels[4].frame = _buttonViews[4].bounds;
+    // 5. Top-left LT / LB and Top-right RT / RB shoulder & trigger buttons
+    const CGFloat shoulderW = 64.0;
+    const CGFloat shoulderH = 34.0;
+    const CGFloat shoulderGap = 10.0;
+
+    // Left: LT outermost top, LB right next to it (or stacked cleanly)
+    _buttonViews[kBtnLT].frame = CGRectMake(leftPad, topPad, shoulderW, shoulderH);
+    _buttonViews[kBtnLT].layer.cornerRadius = 10.0;
+    _buttonLabels[kBtnLT].frame = _buttonViews[kBtnLT].bounds;
+
+    _buttonViews[kBtnLB].frame = CGRectMake(leftPad + shoulderW + shoulderGap, topPad, shoulderW, shoulderH);
+    _buttonViews[kBtnLB].layer.cornerRadius = 10.0;
+    _buttonLabels[kBtnLB].frame = _buttonViews[kBtnLB].bounds;
+
+    // Right: RB + RT mirrored at top-right
+    const CGFloat rtX = bounds.size.width - rightPad - shoulderW;
+    const CGFloat rbX = rtX - shoulderGap - shoulderW;
+
+    _buttonViews[kBtnRB].frame = CGRectMake(rbX, topPad, shoulderW, shoulderH);
+    _buttonViews[kBtnRB].layer.cornerRadius = 10.0;
+    _buttonLabels[kBtnRB].frame = _buttonViews[kBtnRB].bounds;
+
+    _buttonViews[kBtnRT].frame = CGRectMake(rtX, topPad, shoulderW, shoulderH);
+    _buttonViews[kBtnRT].layer.cornerRadius = 10.0;
+    _buttonLabels[kBtnRT].frame = _buttonViews[kBtnRT].bounds;
+
+    // 6. Top-center compact BACK and START buttons
+    const CGFloat metaW = 58.0;
+    const CGFloat metaH = 28.0;
+    const CGFloat metaGap = 16.0;
+    const CGFloat midX = bounds.size.width * 0.5;
+
+    _buttonViews[kBtnBack].frame = CGRectMake(midX - metaGap * 0.5 - metaW, topPad + 3.0, metaW, metaH);
+    _buttonViews[kBtnBack].layer.cornerRadius = metaH * 0.5;
+    _buttonLabels[kBtnBack].frame = _buttonViews[kBtnBack].bounds;
+
+    _buttonViews[kBtnStart].frame = CGRectMake(midX + metaGap * 0.5, topPad + 3.0, metaW, metaH);
+    _buttonViews[kBtnStart].layer.cornerRadius = metaH * 0.5;
+    _buttonLabels[kBtnStart].frame = _buttonViews[kBtnStart].bounds;
 }
 
-// Pass touches outside button hit zones straight through to the underlying SDL view.
+- (BOOL)isPointInsideToggle:(CGPoint)point
+{
+    return CGRectContainsPoint(CGRectInset(_toggleButtonView.frame, -10.0, -10.0), point);
+}
+
+- (int)hitButtonAtPoint:(CGPoint)point
+{
+    for (int i = 0; i < kBtnCount; ++i)
+    {
+        if (CGRectContainsPoint(CGRectInset(_buttonViews[i].frame, -8.0, -8.0), point))
+            return i;
+    }
+    return -1;
+}
+
+- (BOOL)isPointInsideLeftStickZone:(CGPoint)point
+{
+    const CGFloat dx = point.x - _leftStickRestCenter.x;
+    const CGFloat dy = point.y - _leftStickRestCenter.y;
+    const CGFloat hitR = _leftStickRadius + 24.0;
+    return (dx * dx + dy * dy) <= (hitR * hitR);
+}
+
+- (BOOL)isPointInsideRightCameraZone:(CGPoint)point
+{
+    // Right half of the screen outside discrete buttons acts as virtual Right Stick camera drag pad.
+    return point.x >= (self.bounds.size.width * 0.48);
+}
+
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent*)event
 {
-    for (int i = 0; i < 7; ++i)
-    {
-        CGRect hitRect = CGRectInset(_buttonViews[i].frame, -8.0, -8.0);
-        if (CGRectContainsPoint(hitRect, point))
-            return YES;
-    }
+    if ([self isPointInsideToggle:point])
+        return YES;
+
+    if (_controlsHidden)
+        return NO;
+
+    if ([self hitButtonAtPoint:point] >= 0)
+        return YES;
+
+    if ([self isPointInsideLeftStickZone:point])
+        return YES;
+
+    if ([self isPointInsideRightCameraZone:point])
+        return YES;
+
     return NO;
 }
 
-- (void)recomputeButtonStates
+- (void)resetAllInputsAndVisuals
 {
-    uint16_t newMask = 0;
-    bool nextPressed[7]{};
+    [_buttonTouches removeAllObjects];
+    _leftStickTouch = nil;
+    _rightLookTouch = nil;
 
-    for (UITouch* touch in _activeTouches)
+    const CGFloat knobDiameter = 46.0;
+    _leftStickKnob.frame = CGRectMake(
+        _leftStickRestCenter.x - knobDiameter * 0.5,
+        _leftStickRestCenter.y - knobDiameter * 0.5,
+        knobDiameter,
+        knobDiameter);
+
+    for (int i = 0; i < kBtnCount; ++i)
+    {
+        if (_buttonDown[i])
+        {
+            _buttonDown[i] = false;
+            _buttonViews[i].backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.34];
+            EmitTouchGamepadButtonTransition(kTouchPadButtons[i].sdlButton, false);
+        }
+    }
+
+    if (_lastSdlLX != 0) { _lastSdlLX = 0; EmitTouchGamepadAxis(SDL_GAMEPAD_AXIS_LEFTX, 0); }
+    if (_lastSdlLY != 0) { _lastSdlLY = 0; EmitTouchGamepadAxis(SDL_GAMEPAD_AXIS_LEFTY, 0); }
+    if (_lastSdlRX != 0) { _lastSdlRX = 0; EmitTouchGamepadAxis(SDL_GAMEPAD_AXIS_RIGHTX, 0); }
+    if (_lastSdlRY != 0) { _lastSdlRY = 0; EmitTouchGamepadAxis(SDL_GAMEPAD_AXIS_RIGHTY, 0); }
+    if (_lastSdlLT != 0) { _lastSdlLT = 0; EmitTouchGamepadAxis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER, 0); }
+    if (_lastSdlRT != 0) { _lastSdlRT = 0; EmitTouchGamepadAxis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0); }
+
+    HID::SetVirtualGamepadState(0, 0, 0, 0, 0, 0, 0);
+}
+
+- (void)recomputeControllerState
+{
+    if (_controlsHidden)
+        return;
+
+    uint16_t xamButtons = 0;
+    bool nextButtonDown[kBtnCount]{};
+
+    // 1. Evaluate discrete button touches
+    for (UITouch* touch in _buttonTouches)
     {
         if (touch.phase == UITouchPhaseEnded || touch.phase == UITouchPhaseCancelled)
             continue;
 
         const CGPoint pt = [touch locationInView:self];
-        for (int i = 0; i < 7; ++i)
+        for (int i = 0; i < kBtnCount; ++i)
         {
-            CGRect hitRect = CGRectInset(_buttonViews[i].frame, -10.0, -10.0);
-            if (CGRectContainsPoint(hitRect, pt))
+            if (CGRectContainsPoint(CGRectInset(_buttonViews[i].frame, -9.0, -9.0), pt))
             {
-                nextPressed[i] = true;
-                newMask |= kTouchPadButtons[i].xamMask;
+                nextButtonDown[i] = true;
+                xamButtons |= kTouchPadButtons[i].xamMask;
             }
         }
     }
 
-    HID::SetVirtualGamepadButtons(newMask);
-
-    for (int i = 0; i < 7; ++i)
+    for (int i = 0; i < kBtnCount; ++i)
     {
-        const bool wasDown = (_pressedMask & kTouchPadButtons[i].xamMask) != 0;
-        const bool isDown = nextPressed[i];
-        if (wasDown != isDown)
+        if (_buttonDown[i] != nextButtonDown[i])
         {
-            _buttonViews[i].backgroundColor = isDown
-                ? [UIColor colorWithWhite:0.85 alpha:0.55]
-                : [UIColor colorWithWhite:0.10 alpha:0.36];
-            EmitTouchGamepadButtonTransition(kTouchPadButtons[i].sdlButton, isDown);
+            _buttonDown[i] = nextButtonDown[i];
+            _buttonViews[i].backgroundColor = nextButtonDown[i]
+                ? [UIColor colorWithWhite:0.86 alpha:0.56]
+                : [UIColor colorWithWhite:0.10 alpha:0.34];
+            EmitTouchGamepadButtonTransition(kTouchPadButtons[i].sdlButton, nextButtonDown[i]);
         }
     }
 
-    _pressedMask = newMask;
+    const uint8_t xamLT = nextButtonDown[kBtnLT] ? 255u : 0u;
+    const uint8_t xamRT = nextButtonDown[kBtnRT] ? 255u : 0u;
+    const int16_t sdlLT = nextButtonDown[kBtnLT] ? 32767 : 0;
+    const int16_t sdlRT = nextButtonDown[kBtnRT] ? 32767 : 0;
+    if (sdlLT != _lastSdlLT) { _lastSdlLT = sdlLT; EmitTouchGamepadAxis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER, sdlLT); }
+    if (sdlRT != _lastSdlRT) { _lastSdlRT = sdlRT; EmitTouchGamepadAxis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, sdlRT); }
+
+    // 2. Evaluate Left Analog Stick (dynamic origin anchored where finger landed, clamped to _leftStickRadius)
+    int16_t sdlLX = 0;
+    int16_t sdlLY = 0;
+    int16_t xamLX = 0;
+    int16_t xamLY = 0;
+    const CGFloat knobDiameter = 46.0;
+
+    if (_leftStickTouch != nil &&
+        _leftStickTouch.phase != UITouchPhaseEnded &&
+        _leftStickTouch.phase != UITouchPhaseCancelled)
+    {
+        const CGPoint pt = [_leftStickTouch locationInView:self];
+        CGFloat dx = pt.x - _leftStickOrigin.x;
+        CGFloat dy = pt.y - _leftStickOrigin.y;
+        const CGFloat dist = std::hypot(dx, dy);
+        if (dist > _leftStickRadius && dist > 0.0001)
+        {
+            const CGFloat inv = _leftStickRadius / dist;
+            dx *= inv;
+            dy *= inv;
+        }
+
+        const CGPoint knobCenter = CGPointMake(_leftStickRestCenter.x + dx, _leftStickRestCenter.y + dy);
+        _leftStickKnob.frame = CGRectMake(knobCenter.x - knobDiameter * 0.5, knobCenter.y - knobDiameter * 0.5, knobDiameter, knobDiameter);
+
+        const CGFloat normX = dx / _leftStickRadius;
+        const CGFloat normY = dy / _leftStickRadius; // +down in UIKit / SDL, -down in XInput
+        const CGFloat mag = std::hypot(normX, normY);
+        if (mag > 0.12)
+        {
+            sdlLX = ClampFloatToInt16(normX);
+            sdlLY = ClampFloatToInt16(normY);
+            xamLX = ClampFloatToInt16(normX);
+            xamLY = ClampFloatToInt16(-normY);
+        }
+    }
+    else
+    {
+        _leftStickTouch = nil;
+        _leftStickKnob.frame = CGRectMake(
+            _leftStickRestCenter.x - knobDiameter * 0.5,
+            _leftStickRestCenter.y - knobDiameter * 0.5,
+            knobDiameter,
+            knobDiameter);
+    }
+
+    if (sdlLX != _lastSdlLX) { _lastSdlLX = sdlLX; EmitTouchGamepadAxis(SDL_GAMEPAD_AXIS_LEFTX, sdlLX); }
+    if (sdlLY != _lastSdlLY) { _lastSdlLY = sdlLY; EmitTouchGamepadAxis(SDL_GAMEPAD_AXIS_LEFTY, sdlLY); }
+
+    // 3. Evaluate Right Analog Camera Drag Area (virtual stick centered on touch-down point)
+    int16_t sdlRX = 0;
+    int16_t sdlRY = 0;
+    int16_t xamRX = 0;
+    int16_t xamRY = 0;
+    constexpr CGFloat kRightCameraRadius = 68.0;
+
+    if (_rightLookTouch != nil &&
+        _rightLookTouch.phase != UITouchPhaseEnded &&
+        _rightLookTouch.phase != UITouchPhaseCancelled)
+    {
+        const CGPoint pt = [_rightLookTouch locationInView:self];
+        const CGFloat dx = pt.x - _rightLookOrigin.x;
+        const CGFloat dy = pt.y - _rightLookOrigin.y;
+        const CGFloat normX = std::clamp<CGFloat>(dx / kRightCameraRadius, -1.0, 1.0);
+        const CGFloat normY = std::clamp<CGFloat>(dy / kRightCameraRadius, -1.0, 1.0);
+        if (std::hypot(normX, normY) > 0.08)
+        {
+            sdlRX = ClampFloatToInt16(normX);
+            sdlRY = ClampFloatToInt16(normY);
+            xamRX = ClampFloatToInt16(normX);
+            xamRY = ClampFloatToInt16(-normY);
+        }
+    }
+    else
+    {
+        _rightLookTouch = nil;
+    }
+
+    if (sdlRX != _lastSdlRX) { _lastSdlRX = sdlRX; EmitTouchGamepadAxis(SDL_GAMEPAD_AXIS_RIGHTX, sdlRX); }
+    if (sdlRY != _lastSdlRY) { _lastSdlRY = sdlRY; EmitTouchGamepadAxis(SDL_GAMEPAD_AXIS_RIGHTY, sdlRY); }
+
+    HID::SetVirtualGamepadState(xamButtons, xamLT, xamRT, xamLX, xamLY, xamRX, xamRY);
 }
 
 - (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
 {
     for (UITouch* t in touches)
-        [_activeTouches addObject:t];
-    [self recomputeButtonStates];
+    {
+        const CGPoint pt = [t locationInView:self];
+
+        if ([self isPointInsideToggle:pt])
+        {
+            _toggleTouch = t;
+            _controlsHidden = !_controlsHidden;
+            _controlsContainer.hidden = _controlsHidden;
+            _toggleButtonLabel.text = _controlsHidden ? @"<<" : @">>";
+            if (_controlsHidden)
+                [self resetAllInputsAndVisuals];
+            continue;
+        }
+
+        if (_controlsHidden)
+            continue;
+
+        if ([self hitButtonAtPoint:pt] >= 0)
+        {
+            [_buttonTouches addObject:t];
+        }
+        else if (_leftStickTouch == nil && [self isPointInsideLeftStickZone:pt])
+        {
+            _leftStickTouch = t;
+            _leftStickOrigin = pt;
+        }
+        else if (_rightLookTouch == nil && [self isPointInsideRightCameraZone:pt])
+        {
+            _rightLookTouch = t;
+            _rightLookOrigin = pt;
+        }
+    }
+
+    [self recomputeControllerState];
 }
 
 - (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
 {
-    [self recomputeButtonStates];
+    [self recomputeControllerState];
 }
 
 - (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
 {
     for (UITouch* t in touches)
-        [_activeTouches removeObject:t];
-    [self recomputeButtonStates];
+    {
+        if (t == _toggleTouch)
+            _toggleTouch = nil;
+        if (t == _leftStickTouch)
+            _leftStickTouch = nil;
+        if (t == _rightLookTouch)
+            _rightLookTouch = nil;
+        [_buttonTouches removeObject:t];
+    }
+
+    [self recomputeControllerState];
 }
 
 - (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
 {
     for (UITouch* t in touches)
-        [_activeTouches removeObject:t];
-    [self recomputeButtonStates];
+    {
+        if (t == _toggleTouch)
+            _toggleTouch = nil;
+        if (t == _leftStickTouch)
+            _leftStickTouch = nil;
+        if (t == _rightLookTouch)
+            _rightLookTouch = nil;
+        [_buttonTouches removeObject:t];
+    }
+
+    [self recomputeControllerState];
 }
 
 @end
@@ -634,6 +1087,9 @@ void os::ios::InstallTouchControllerOverlay(void* uiWindowPtr)
             MarathonTouchOverlayView* overlay = [[MarathonTouchOverlayView alloc] initWithFrame:rootView.bounds];
             [rootView addSubview:overlay];
             [rootView bringSubviewToFront:overlay];
+#if !__has_feature(objc_arc)
+            [overlay release];
+#endif
         }
     });
 }

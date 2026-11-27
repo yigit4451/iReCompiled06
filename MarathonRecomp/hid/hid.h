@@ -16,4 +16,5 @@ namespace HID
     void NotifyTouchSkipReleased();
     void SetVirtualGamepadButtons(uint16_t in_xamButtonMask);
     uint16_t GetVirtualGamepadButtons();
+    void SetVirtualGamepadState(uint16_t in_xamButtonMask, uint8_t in_leftTrigger, uint8_t in_rightTrigger, int16_t in_thumbLX, int16_t in_thumbLY, int16_t in_thumbRX, int16_t in_thumbRY);
 }
