@@ -68,4 +68,8 @@ namespace os::ios
 
     // Requests landscape-only geometry on every connected UIWindowScene (LandscapeLeft / LandscapeRight).
     void EnforceLandscapeOrientation();
+
+    // Installs a semi-transparent touch controller overlay (D-Pad, Start, A, B) on the SDL UIWindow
+    // that posts SDL_EVENT_GAMEPAD_BUTTON_DOWN / SDL_EVENT_GAMEPAD_BUTTON_UP and updates XInput state.
+    void InstallTouchControllerOverlay(void* uiWindow);
 }

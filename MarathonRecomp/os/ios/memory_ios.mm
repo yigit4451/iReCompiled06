@@ -1,5 +1,7 @@
 #include <os/ios/memory_ios.h>
 #include <os/logger.h>
+#include <hid/hid.h>
+#include <SDL3/SDL.h>
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -339,4 +341,299 @@ void os::ios::EnforceLandscapeOrientation()
         apply();
     else
         dispatch_async(dispatch_get_main_queue(), apply);
+}
+
+namespace
+{
+    struct TouchPadButtonSpec
+    {
+        const char* label;
+        SDL_GamepadButton sdlButton;
+        uint16_t xamMask;
+    };
+
+    constexpr TouchPadButtonSpec kTouchPadButtons[7] =
+    {
+        { "▲",     SDL_GAMEPAD_BUTTON_DPAD_UP,    XAMINPUT_GAMEPAD_DPAD_UP },
+        { "▼",     SDL_GAMEPAD_BUTTON_DPAD_DOWN,  XAMINPUT_GAMEPAD_DPAD_DOWN },
+        { "◀",     SDL_GAMEPAD_BUTTON_DPAD_LEFT,  XAMINPUT_GAMEPAD_DPAD_LEFT },
+        { "▶",     SDL_GAMEPAD_BUTTON_DPAD_RIGHT, XAMINPUT_GAMEPAD_DPAD_RIGHT },
+        { "START", SDL_GAMEPAD_BUTTON_START,      XAMINPUT_GAMEPAD_START },
+        { "A",     SDL_GAMEPAD_BUTTON_SOUTH,      XAMINPUT_GAMEPAD_A },
+        { "B",     SDL_GAMEPAD_BUTTON_EAST,       XAMINPUT_GAMEPAD_B }
+    };
+
+    SDL_JoystickID g_virtualJoystickId = 0;
+    SDL_Joystick* g_virtualJoystick = nullptr;
+
+    void EnsureVirtualGamepadAttached()
+    {
+        if (g_virtualJoystick != nullptr)
+            return;
+
+        SDL_VirtualJoystickDesc desc{};
+        SDL_INIT_INTERFACE(&desc);
+        desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        desc.button_mask =
+            (1u << SDL_GAMEPAD_BUTTON_SOUTH) |
+            (1u << SDL_GAMEPAD_BUTTON_EAST) |
+            (1u << SDL_GAMEPAD_BUTTON_WEST) |
+            (1u << SDL_GAMEPAD_BUTTON_NORTH) |
+            (1u << SDL_GAMEPAD_BUTTON_START) |
+            (1u << SDL_GAMEPAD_BUTTON_BACK) |
+            (1u << SDL_GAMEPAD_BUTTON_DPAD_UP) |
+            (1u << SDL_GAMEPAD_BUTTON_DPAD_DOWN) |
+            (1u << SDL_GAMEPAD_BUTTON_DPAD_LEFT) |
+            (1u << SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
+        desc.name = "iReCompiled06 Touch Gamepad";
+
+        g_virtualJoystickId = SDL_AttachVirtualJoystick(&desc);
+        if (g_virtualJoystickId != 0)
+            g_virtualJoystick = SDL_OpenJoystick(g_virtualJoystickId);
+    }
+
+    void EmitTouchGamepadButtonTransition(SDL_GamepadButton sdlBtn, bool down)
+    {
+        EnsureVirtualGamepadAttached();
+
+        if (g_virtualJoystick != nullptr)
+        {
+            SDL_SetJoystickVirtualButton(g_virtualJoystick, static_cast<int>(sdlBtn), down);
+        }
+        else
+        {
+            SDL_Event ev{};
+            ev.type = down ? SDL_EVENT_GAMEPAD_BUTTON_DOWN : SDL_EVENT_GAMEPAD_BUTTON_UP;
+            ev.gbutton.timestamp = SDL_GetTicksNS();
+            ev.gbutton.which = g_virtualJoystickId != 0 ? g_virtualJoystickId : 1;
+            ev.gbutton.button = static_cast<Uint8>(sdlBtn);
+            ev.gbutton.down = down;
+            SDL_PushEvent(&ev);
+        }
+    }
+}
+
+@interface MarathonTouchOverlayView : UIView
+@end
+
+@implementation MarathonTouchOverlayView
+{
+    UIView* _buttonViews[7];
+    UILabel* _buttonLabels[7];
+    uint16_t _pressedMask;
+    NSMutableSet<UITouch*>* _activeTouches;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame
+{
+    self = [super initWithFrame:frame];
+    if (self)
+    {
+        self.backgroundColor = [UIColor clearColor];
+        self.opaque = NO;
+        self.multipleTouchEnabled = YES;
+        self.userInteractionEnabled = YES;
+        self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        _pressedMask = 0;
+        _activeTouches = [NSMutableSet set];
+
+        for (int i = 0; i < 7; ++i)
+        {
+            UIView* btn = [[UIView alloc] initWithFrame:CGRectZero];
+            btn.userInteractionEnabled = NO;
+            btn.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.36];
+            btn.layer.borderWidth = 1.5;
+
+            if (i == 5) // A (green)
+                btn.layer.borderColor = [UIColor colorWithRed:0.25 green:0.95 blue:0.45 alpha:0.65].CGColor;
+            else if (i == 6) // B (red)
+                btn.layer.borderColor = [UIColor colorWithRed:0.98 green:0.32 blue:0.32 alpha:0.65].CGColor;
+            else if (i == 4) // START (cyan)
+                btn.layer.borderColor = [UIColor colorWithRed:0.35 green:0.85 blue:1.00 alpha:0.65].CGColor;
+            else
+                btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.45].CGColor;
+
+            UILabel* lbl = [[UILabel alloc] initWithFrame:CGRectZero];
+            lbl.text = [NSString stringWithUTF8String:kTouchPadButtons[i].label];
+            lbl.textAlignment = NSTextAlignmentCenter;
+            lbl.textColor = [UIColor colorWithWhite:1.0 alpha:0.85];
+            lbl.font = [UIFont boldSystemFontOfSize:(i == 4 ? 13.0 : 19.0)];
+            [btn addSubview:lbl];
+
+            [self addSubview:btn];
+            _buttonViews[i] = btn;
+            _buttonLabels[i] = lbl;
+        }
+    }
+    return self;
+}
+
+- (void)layoutSubviews
+{
+    [super layoutSubviews];
+
+    const CGRect bounds = self.bounds;
+    const UIEdgeInsets safe = self.safeAreaInsets;
+    const CGFloat leftPad = MAX(safe.left, 18.0) + 12.0;
+    const CGFloat rightPad = MAX(safe.right, 18.0) + 16.0;
+    const CGFloat bottomPad = MAX(safe.bottom, 14.0) + 14.0;
+
+    // Bottom-left D-Pad cross
+    const CGFloat dpadSize = 48.0;
+    const CGFloat dpadStep = 50.0;
+    const CGFloat dpadCenterX = leftPad + dpadStep + dpadSize * 0.5;
+    const CGFloat dpadCenterY = bounds.size.height - bottomPad - dpadStep - dpadSize * 0.5;
+
+    const CGPoint dpadCenters[4] =
+    {
+        CGPointMake(dpadCenterX, dpadCenterY - dpadStep), // Up
+        CGPointMake(dpadCenterX, dpadCenterY + dpadStep), // Down
+        CGPointMake(dpadCenterX - dpadStep, dpadCenterY), // Left
+        CGPointMake(dpadCenterX + dpadStep, dpadCenterY)  // Right
+    };
+
+    for (int i = 0; i < 4; ++i)
+    {
+        CGRect f = CGRectMake(dpadCenters[i].x - dpadSize * 0.5, dpadCenters[i].y - dpadSize * 0.5, dpadSize, dpadSize);
+        _buttonViews[i].frame = f;
+        _buttonViews[i].layer.cornerRadius = 12.0;
+        _buttonLabels[i].frame = _buttonViews[i].bounds;
+    }
+
+    // Bottom-right Start, A, B buttons
+    const CGFloat abSize = 58.0;
+    const CGFloat bCenterX = bounds.size.width - rightPad - abSize * 0.5;
+    const CGFloat bCenterY = bounds.size.height - bottomPad - abSize * 0.5 - 38.0;
+    const CGFloat aCenterX = bCenterX - 66.0;
+    const CGFloat aCenterY = bounds.size.height - bottomPad - abSize * 0.5 + 4.0;
+
+    _buttonViews[5].frame = CGRectMake(aCenterX - abSize * 0.5, aCenterY - abSize * 0.5, abSize, abSize);
+    _buttonViews[5].layer.cornerRadius = abSize * 0.5;
+    _buttonLabels[5].frame = _buttonViews[5].bounds;
+
+    _buttonViews[6].frame = CGRectMake(bCenterX - abSize * 0.5, bCenterY - abSize * 0.5, abSize, abSize);
+    _buttonViews[6].layer.cornerRadius = abSize * 0.5;
+    _buttonLabels[6].frame = _buttonViews[6].bounds;
+
+    const CGFloat startW = 78.0;
+    const CGFloat startH = 36.0;
+    const CGFloat startX = aCenterX - 96.0 - startW * 0.5;
+    const CGFloat startY = bounds.size.height - bottomPad - startH - 4.0;
+    _buttonViews[4].frame = CGRectMake(startX, startY, startW, startH);
+    _buttonViews[4].layer.cornerRadius = startH * 0.5;
+    _buttonLabels[4].frame = _buttonViews[4].bounds;
+}
+
+// Pass touches outside button hit zones straight through to the underlying SDL view.
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent*)event
+{
+    for (int i = 0; i < 7; ++i)
+    {
+        CGRect hitRect = CGRectInset(_buttonViews[i].frame, -8.0, -8.0);
+        if (CGRectContainsPoint(hitRect, point))
+            return YES;
+    }
+    return NO;
+}
+
+- (void)recomputeButtonStates
+{
+    uint16_t newMask = 0;
+    bool nextPressed[7]{};
+
+    for (UITouch* touch in _activeTouches)
+    {
+        if (touch.phase == UITouchPhaseEnded || touch.phase == UITouchPhaseCancelled)
+            continue;
+
+        const CGPoint pt = [touch locationInView:self];
+        for (int i = 0; i < 7; ++i)
+        {
+            CGRect hitRect = CGRectInset(_buttonViews[i].frame, -10.0, -10.0);
+            if (CGRectContainsPoint(hitRect, pt))
+            {
+                nextPressed[i] = true;
+                newMask |= kTouchPadButtons[i].xamMask;
+            }
+        }
+    }
+
+    HID::SetVirtualGamepadButtons(newMask);
+
+    for (int i = 0; i < 7; ++i)
+    {
+        const bool wasDown = (_pressedMask & kTouchPadButtons[i].xamMask) != 0;
+        const bool isDown = nextPressed[i];
+        if (wasDown != isDown)
+        {
+            _buttonViews[i].backgroundColor = isDown
+                ? [UIColor colorWithWhite:0.85 alpha:0.55]
+                : [UIColor colorWithWhite:0.10 alpha:0.36];
+            EmitTouchGamepadButtonTransition(kTouchPadButtons[i].sdlButton, isDown);
+        }
+    }
+
+    _pressedMask = newMask;
+}
+
+- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
+{
+    for (UITouch* t in touches)
+        [_activeTouches addObject:t];
+    [self recomputeButtonStates];
+}
+
+- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
+{
+    [self recomputeButtonStates];
+}
+
+- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
+{
+    for (UITouch* t in touches)
+        [_activeTouches removeObject:t];
+    [self recomputeButtonStates];
+}
+
+- (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
+{
+    for (UITouch* t in touches)
+        [_activeTouches removeObject:t];
+    [self recomputeButtonStates];
+}
+
+@end
+
+void os::ios::InstallTouchControllerOverlay(void* uiWindowPtr)
+{
+    if (uiWindowPtr == nullptr)
+        return;
+
+    os::ios::RunOnMainThreadSync([uiWindowPtr]()
+    {
+        @autoreleasepool
+        {
+            EnsureVirtualGamepadAttached();
+
+            UIWindow* window = (__bridge UIWindow*)uiWindowPtr;
+            UIView* rootView = window.rootViewController != nil ? window.rootViewController.view : window;
+            if (rootView == nil)
+                return;
+
+            for (UIView* sub in rootView.subviews)
+            {
+                if ([sub isKindOfClass:[MarathonTouchOverlayView class]])
+                {
+                    [rootView bringSubviewToFront:sub];
+                    return;
+                }
+            }
+
+            MarathonTouchOverlayView* overlay = [[MarathonTouchOverlayView alloc] initWithFrame:rootView.bounds];
+            [rootView addSubview:overlay];
+            [rootView bringSubviewToFront:overlay];
+        }
+    });
 }

@@ -497,7 +497,7 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode, uint32_t Al
     {
         if (timeout != 0)
         {
-            Watchdog::ScopedWait waitGuard("NtWaitForSingleObjectEx", callerLr, Handle, timeout);
+            Watchdog::ScopedWait waitGuard("NtWaitForSingleObjectEx", callerLr, Handle, timeout, 0x101u);
             return GetKernelObject(Handle)->Wait(timeout);
         }
         Watchdog::Heartbeat(callerLr);
@@ -815,7 +815,7 @@ void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
 
     std::atomic_ref owningThread(cs->OwningThread);
     owningThread.store(0);
-    owningThread.notify_one();
+    owningThread.notify_all();
 }
 
 void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
@@ -837,7 +837,7 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
 
         const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
         const uint32_t csAddr = g_memory.IsInMemoryRange(cs) ? g_memory.MapVirtual(cs) : 0u;
-        Watchdog::ScopedWait waitGuard("RtlEnterCriticalSection", callerLr, csAddr, INFINITE);
+        Watchdog::ScopedWait waitGuard("RtlEnterCriticalSection", callerLr, csAddr, INFINITE, 0x100u);
         owningThread.wait(previousOwner);
     }
 }
@@ -1199,7 +1199,7 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, 
     const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
     const uint32_t guestObjAddr = g_memory.IsInMemoryRange(Object) ? g_memory.MapVirtual(Object) : 0u;
 
-    Watchdog::ScopedWait waitGuard("KeWaitForSingleObject", callerLr, guestObjAddr, timeout);
+    Watchdog::ScopedWait waitGuard("KeWaitForSingleObject", callerLr, guestObjAddr, timeout, static_cast<uint32_t>(Object->Type));
 
     switch (Object->Type)
     {
@@ -1607,7 +1607,7 @@ uint32_t NtWaitForMultipleObjectsEx(uint32_t Count, be<uint32_t>* Handles, uint3
     const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
     const uint32_t firstHandle = Handles[0].get();
 
-    Watchdog::ScopedWait waitGuard("NtWaitForMultipleObjectsEx", callerLr, firstHandle, timeout);
+    Watchdog::ScopedWait waitGuard("NtWaitForMultipleObjectsEx", callerLr, firstHandle, timeout, 0x102u);
 
     if (WaitType == 0) // WaitAll
     {
@@ -1881,7 +1881,7 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
     const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
     const uint32_t firstObjAddr = (Count > 0 && Objects != nullptr) ? Objects[0].ptr.get() : 0u;
 
-    Watchdog::ScopedWait waitGuard("KeWaitForMultipleObjects", callerLr, firstObjAddr, timeout);
+    Watchdog::ScopedWait waitGuard("KeWaitForMultipleObjects", callerLr, firstObjAddr, timeout, 0x102u);
 
     if (WaitType == 0) // Wait all
     {
@@ -1916,7 +1916,7 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
 
         while (true)
         {
-            uint32_t generation = g_keSetEventGeneration.load();
+            const uint32_t generation = g_keSetEventGeneration.load(std::memory_order_acquire);
 
             for (size_t i = 0; i < Count; i++)
             {
@@ -1924,16 +1924,13 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
                     return STATUS_WAIT_0 + static_cast<uint32_t>(i);
             }
 
-            if (timeout == INFINITE)
-            {
-                g_keSetEventGeneration.wait(generation);
-            }
-            else
-            {
-                if (std::chrono::steady_clock::now() >= deadline)
-                    return STATUS_TIMEOUT;
+            if (timeout != INFINITE && std::chrono::steady_clock::now() >= deadline)
+                return STATUS_TIMEOUT;
+
+            // Avoid unbounded std::atomic::wait on Darwin ulock where rapid KeSetEvent increments on XAudio /
+            // FrameSynchronizer worker events can miss a single wakeup edge; re-poll after 1 ms if unchanged.
+            if (g_keSetEventGeneration.load(std::memory_order_acquire) == generation)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
         }
     }
 

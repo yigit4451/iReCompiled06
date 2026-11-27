@@ -72,7 +72,7 @@ static void AudioThread()
 
     while (!g_audioThreadShouldExit)
     {
-        Watchdog::Heartbeat(0);
+        Watchdog::Heartbeat(static_cast<uint32_t>(ctx.ppcContext.lr));
 
         const size_t callbackAudioSize = channels * XAUDIO_NUM_SAMPLES * sizeof(float);
         int queuedAudioSize = g_audioStream != nullptr ? SDL_GetAudioStreamQueued(g_audioStream) : -1;
@@ -87,6 +87,7 @@ static void AudioThread()
                 {
                     ctx.ppcContext.r3.u32 = g_clientCallbackParam;
                     g_clientCallback(ctx.ppcContext, g_memory.base);
+                    Watchdog::Heartbeat(static_cast<uint32_t>(ctx.ppcContext.lr));
                 }
             }
         }
@@ -99,6 +100,7 @@ static void AudioThread()
             {
                 ctx.ppcContext.r3.u32 = g_clientCallbackParam;
                 g_clientCallback(ctx.ppcContext, g_memory.base);
+                Watchdog::Heartbeat(static_cast<uint32_t>(ctx.ppcContext.lr));
             }
         }
 

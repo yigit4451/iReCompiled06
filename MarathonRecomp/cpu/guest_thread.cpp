@@ -43,10 +43,12 @@ GuestThreadContext::GuestThreadContext(uint32_t cpuNumber)
 
     assert(GetPPCContext() == nullptr);
     SetPPCContext(ppcContext);
+    Watchdog::AttachCurrentThreadPPCContext(&ppcContext);
 }
 
 GuestThreadContext::~GuestThreadContext()
 {
+    Watchdog::AttachCurrentThreadPPCContext(nullptr);
     g_userHeap.Free(thread);
 }
 
@@ -185,7 +187,7 @@ static void GuestThreadFunc(void* data)
     const std::string threadName = GetGuestThreadName(hThread->params);
     Watchdog::RegisterCurrentThread(Watchdog::ThreadKind::GuestWorker, threadName.c_str(), hThread->params.function);
     {
-        Watchdog::ScopedWait waitGuard("GuestThread::InitialSuspend", hThread->params.function, 0, INFINITE);
+        Watchdog::ScopedWait waitGuard("GuestThread::InitialSuspend", hThread->params.function, 0, INFINITE, 0x104u);
         hThread->suspended.wait(true);
     }
     GuestThread::Start(hThread->params);

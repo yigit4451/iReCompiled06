@@ -2457,7 +2457,7 @@ void Video::WaitOnSwapChain()
         if (g_swapChainValid)
         {
             const uint32_t callerLr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
-            Watchdog::ScopedWait waitGuard("Video::WaitOnSwapChain", callerLr, 0, 1000u);
+            Watchdog::ScopedWait waitGuard("Video::WaitOnSwapChain", callerLr, 0, 1000u, 0x103u);
             g_presentWaitProfiler.Begin();
             g_swapChain->wait();
             g_presentWaitProfiler.End();
@@ -2607,7 +2607,7 @@ void Video::Present()
     g_renderQueue.enqueue(RenderCommands::ExecuteCommandList{});
 
     {
-        Watchdog::ScopedWait waitGuard("Video::Present->ExecuteCommandList", callerLr, 0, 0xFFFFFFFFu);
+        Watchdog::ScopedWait waitGuard("Video::Present->ExecuteCommandList", callerLr, 0, 0xFFFFFFFFu, 0x103u);
         g_executedCommandList.wait(false);
     }
     g_executedCommandList = false;
@@ -2616,7 +2616,7 @@ void Video::Present()
     {
         if (g_pendingWaitOnSwapChain)
         {
-            Watchdog::ScopedWait waitGuard("Video::Present->SwapChainWait", callerLr, 0, 1000u);
+            Watchdog::ScopedWait waitGuard("Video::Present->SwapChainWait", callerLr, 0, 1000u, 0x103u);
             g_presentWaitProfiler.Begin();
             g_swapChain->wait(); // Never gonna happen outside loading threads as explained above.
             g_presentWaitProfiler.End();
@@ -2633,7 +2633,7 @@ void Video::Present()
 
     if (g_commandListStates[g_frame])
     {
-        Watchdog::ScopedWait waitGuard("Video::Present->waitForCommandFence", callerLr, g_frame, 3000u);
+        Watchdog::ScopedWait waitGuard("Video::Present->waitForCommandFence", callerLr, g_frame, 3000u, 0x103u);
         g_frameFenceProfiler.Begin();
         g_queue->waitForCommandFence(g_commandFences[g_frame].get());
         g_frameFenceProfiler.End();
@@ -2644,6 +2644,8 @@ void Video::Present()
         const uint64_t *frameTimestamps = g_queryPools[g_frame]->getResults();
         g_gpuFrameProfiler.Set(static_cast<double>(frameTimestamps[1] - frameTimestamps[0]) / 1000000.0);
     }
+
+    Watchdog::NotifyFramePresented(callerLr);
 
     g_dirtyStates = DirtyStates(true);
     g_uploadAllocators[g_frame].reset();

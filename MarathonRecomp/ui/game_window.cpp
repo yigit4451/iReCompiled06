@@ -327,6 +327,9 @@ void GameWindow::Init(const char* sdlVideoDriver)
     SDL_ShowWindow(s_pWindow);
 
 #if defined(__APPLE__) && TARGET_OS_IOS
+    // Install semi-transparent touch controller overlay (D-Pad, Start, A, B) on top of SDL's Metal view.
+    os::ios::InstallTouchControllerOverlay(s_renderWindow.window);
+
     // On iOS, UIApplication is already active when SwiftUI launches MarathonMain, so SDL_EVENT_WINDOW_FOCUS_GAINED
     // may have already passed before window creation; ensure HID::IsInputAllowed() is active immediately.
     s_isFocused = true;

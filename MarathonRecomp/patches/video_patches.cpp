@@ -1,4 +1,5 @@
 #include <api/Marathon.h>
+#include <cpu/guest_thread.h>
 #include <gpu/render_resolution.h>
 #include <gpu/video.h>
 #include <kernel/memory.h>
@@ -385,43 +386,92 @@ static int ScreenShaderInit(be<uint32_t>* a1)
 GUEST_FUNCTION_HOOK(sub_82736178, ScreenShaderInit);
 
 // ---------------------------------------------------------------------------------------------------------------------
-// XMV / Criware movie player stall guard (SONIC TEAM logo -> opening movie).
+// XMV / Criware movie player stall guard (SONIC TEAM logo -> opening movie -> Title Screen).
 //
 // sub_82743680 is the XMV "get next frame" call made by Sonicteam::MovieObjectWmv::Update (sub_8264C8D0). Its worker
 // threads (0x827422F8..0x82742388) and the XAudio callback can lock each other up, leaving the game thread in an
-// infinite KeWaitForSingleObject. KeWaitForSingleObject (imports.cpp) slices waits made from the XMV code range and
-// aborts them once this call has stalled for XMV_STALL_LIMIT_MS; this hook then finishes the movie cleanly by
-// raising the player's stop bits, waking its internal events and reporting XMEDIA_W_EOF / state 7 (Finished), so the
-// game advances to the title screen instead of hanging.
+// infinite KeWaitForSingleObject or leaving a worker thread suspended/holding an XAudio voice lock when the player is
+// destroyed on transition to TitleTask.
 // ---------------------------------------------------------------------------------------------------------------------
 extern std::atomic<bool> g_xmvAbortRequested;
 extern thread_local uint64_t g_xmvFrameCallStartMs;
 uint64_t XmvNowMs();
 bool KeSetEvent(XKEVENT* pEvent, uint32_t Increment, bool Wait);
+uint32_t NtResumeThread(GuestThreadHandle* hThread, be<uint32_t>* suspendCount);
 
 static constexpr uint32_t XMV_EOF_RESULT = 0x16660026; // XMEDIA_W_EOF = (5734 << 16) | 38
 static constexpr uint32_t XMV_STATE_FINISHED = 7;
 static uint32_t g_xmvAbortedPlayer = 0;
 
-static void XmvFinishPlayer(uint8_t* base, uint32_t player)
+// Track CCalXmvPlayer* passed into CCalXmvPlayer::GetStatus (sub_82733640) so we can mute/quiesce its XAudioSourceVoice
+// before MovieObjectWmv::Update destroys the player on EOF.
+static uint32_t g_lastCalXmvPlayer = 0;
+
+static void XmvQuiesceCalAudioVoice(uint8_t* base, uint32_t calPlayerAddr)
 {
-    if (!player)
+    if (calPlayerAddr < 0x10000u)
         return;
 
-    // Stop bit (0x4) checked by the stream reader / audio feeder / video decoder worker loops.
-    for (const uint32_t offset : { 220u, 224u, 228u })
+    auto* pCalPlayer = reinterpret_cast<CCalXmvPlayer*>(base + calPlayerAddr);
+    if (!pCalPlayer->m_pChannel)
+        return;
+
+    auto* pAudioRenderer = pCalPlayer->m_pChannel->m_pAudioRenderer.get();
+    if (!pAudioRenderer)
+        return;
+
+    auto* pSourceVoice = pAudioRenderer->m_pSourceVoice.get();
+    if (!pSourceVoice)
+        return;
+
+    // Mute and silence XAudioSourceVoice immediately so AudioThread (sub_8255B9C0 -> XAudio worker 0x8255B848)
+    // stops pulling XMV packets or contending on the XMV stream CriticalSection while MovieObjectWmv tears down.
+    pSourceVoice->m_IsMuted = true;
+    pSourceVoice->m_Volume = 0.0f;
+}
+
+static void XmvFinishPlayer(uint8_t* base, uint32_t player)
+{
+    if (player < 0x10000u)
+        return;
+
+    // Quiesce the wrapping CCalXmvPlayer's XAudio voice first so AudioThread never blocks during teardown.
+    if (g_lastCalXmvPlayer != 0)
+        XmvQuiesceCalAudioVoice(base, g_lastCalXmvPlayer);
+
+    // Raise stop bit (0x4) checked by the stream reader / audio feeder / video decoder / audio renderer worker loops
+    // (player + 252, 256, 260 in IXMediaXmvPlayer, plus 220, 224, 228 if offset from subobject).
+    for (const uint32_t offset : { 220u, 224u, 228u, 252u, 256u, 260u })
     {
         auto* flags = reinterpret_cast<be<uint32_t>*>(base + player + offset);
-        *flags = flags->get() | 0x4u;
+        const uint32_t cur = flags->get();
+        if (cur <= 0xFFu)
+            *flags = cur | 0x4u;
     }
 
-    // Wake every internal auto-reset event (+84..+196, 16-byte stride) so blocked workers observe the stop bits.
+    // Resume any worker threads (player + 264..276) that were created with CREATE_SUSPENDED (e.g. 0x82742388)
+    // so MovieObjectWmv's destructor never deadlocks joining an unresumed thread!
+    for (const uint32_t handleOffset : { 264u, 268u, 272u, 276u })
+    {
+        const uint32_t hVal = reinterpret_cast<be<uint32_t>*>(base + player + handleOffset)->get();
+        if (hVal != 0 && hVal != GUEST_INVALID_HANDLE_VALUE && IsKernelObject(hVal))
+        {
+            auto* hThread = GetKernelObject<GuestThreadHandle>(hVal);
+            be<uint32_t> prevSuspend = 0;
+            NtResumeThread(hThread, &prevSuspend);
+        }
+    }
+
+    // Wake every internal XKEVENT (+84..+196, 16-byte stride) ONLY if already initialized by the guest
+    // (WaitListHead.Flink == OBJECT_SIGNATURE or valid Type 0/1 with SignalState <= 1) so we never corrupt adjacent fields.
     for (uint32_t offset = 84; offset <= 196; offset += 16)
     {
         auto* event = reinterpret_cast<XKEVENT*>(base + player + offset);
-
-        if (event->Type == 0 || event->Type == 1)
+        if (event->WaitListHead.Flink == OBJECT_SIGNATURE ||
+            ((event->Type == 0 || event->Type == 1) && event->SignalState.get() <= 1u))
+        {
             KeSetEvent(event, 0, false);
+        }
     }
 }
 
@@ -430,7 +480,7 @@ PPC_FUNC(sub_82743680)
 {
     const uint32_t player = ctx.r3.u32;
 
-    // A different player means a new movie started; forget the previous abort.
+    // A different player means a new movie started; forget the previous abort cleanly.
     if (g_xmvAbortedPlayer != 0 && g_xmvAbortedPlayer != player)
     {
         g_xmvAbortedPlayer = 0;
@@ -439,6 +489,7 @@ PPC_FUNC(sub_82743680)
 
     if (g_xmvAbortedPlayer == player && player != 0)
     {
+        XmvFinishPlayer(base, player);
         ctx.r3.u32 = XMV_EOF_RESULT;
         return;
     }
@@ -449,24 +500,34 @@ PPC_FUNC(sub_82743680)
 
     if (g_xmvAbortRequested.load(std::memory_order_acquire))
     {
-        LOGN_WARNING("XMV: finishing stalled movie playback (EOF).");
+        LOGN_WARNING("XMV: finishing stalled movie playback cleanly (EOF + audio/worker drain).");
 
         g_xmvAbortedPlayer = player;
         XmvFinishPlayer(base, player);
+        // Clear the global abort flag once the stalled player has been transitioned to EOF so subsequent
+        // movies or audio streams on the Title Screen are completely unaffected.
+        g_xmvAbortRequested.store(false, std::memory_order_release);
         ctx.r3.u32 = XMV_EOF_RESULT;
     }
 }
 
-// XMV playback status query used by MovieObjectWmv::Update (status 7 => finished, player is destroyed).
+// CCalXmvPlayer::GetStatus (sub_82733640) queried by MovieObjectWmv::Update (status 7 => finished, player is destroyed).
 PPC_FUNC_IMPL(__imp__sub_82733640);
 PPC_FUNC(sub_82733640)
 {
-    const uint32_t player = ctx.r3.u32;
+    const uint32_t calPlayer = ctx.r3.u32;
     const uint32_t pStatus = ctx.r4.u32;
 
-    if (g_xmvAbortedPlayer != 0 && g_xmvAbortedPlayer == player && pStatus != 0)
+    if (calPlayer >= 0x10000u)
+        g_lastCalXmvPlayer = calPlayer;
+
+    if (g_xmvAbortedPlayer != 0 && pStatus >= 0x10000u)
     {
+        XmvQuiesceCalAudioVoice(base, calPlayer);
         *reinterpret_cast<be<uint32_t>*>(base + pStatus) = XMV_STATE_FINISHED;
+        // Clear g_xmvAbortedPlayer after reporting FINISHED so MovieObjectWmv::Update tears down this movie
+        // once and future movies start fresh.
+        g_xmvAbortedPlayer = 0;
         ctx.r3.u32 = 0;
         return;
     }

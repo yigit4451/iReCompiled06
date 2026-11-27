@@ -14,4 +14,6 @@ namespace HID
     bool IsInputAllowed();
     void NotifyTouchSkipPressed();
     void NotifyTouchSkipReleased();
+    void SetVirtualGamepadButtons(uint16_t in_xamButtonMask);
+    uint16_t GetVirtualGamepadButtons();
 }

@@ -51,12 +51,8 @@ namespace HID
 
 #ifdef MARATHON_RECOMP_IOS
             case SDL_EVENT_FINGER_DOWN:
-                NotifyTouchSkipPressed();
-                break;
-
             case SDL_EVENT_FINGER_UP:
             case SDL_EVENT_FINGER_CANCELED:
-                NotifyTouchSkipReleased();
                 break;
 #endif
 

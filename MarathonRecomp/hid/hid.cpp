@@ -9,13 +9,12 @@ namespace HID
     {
         std::atomic<int32_t> g_activeTouchFingers{ 0 };
         std::atomic<uint32_t> g_touchSkipPulsePolls{ 0 };
+        std::atomic<uint16_t> g_virtualGamepadButtons{ 0 };
     }
 
     void NotifyTouchSkipPressed()
     {
         g_activeTouchFingers.fetch_add(1, std::memory_order_relaxed);
-        // Guarantee at least 6 XInput polls (~100 ms at 60 Hz) see Start+A held even on a sub-frame quick tap
-        // so edge-triggered intro/movie skip listeners never miss a tap between frames.
         g_touchSkipPulsePolls.store(6, std::memory_order_relaxed);
     }
 
@@ -25,6 +24,16 @@ namespace HID
         while (cur > 0 && !g_activeTouchFingers.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed))
         {
         }
+    }
+
+    void SetVirtualGamepadButtons(uint16_t in_xamButtonMask)
+    {
+        g_virtualGamepadButtons.store(in_xamButtonMask, std::memory_order_relaxed);
+    }
+
+    uint16_t GetVirtualGamepadButtons()
+    {
+        return g_virtualGamepadButtons.load(std::memory_order_relaxed);
     }
 
     bool GetState(uint32_t in_userIndex, XAMINPUT_STATE* out_pState)
@@ -45,6 +54,8 @@ namespace HID
 #ifdef MARATHON_RECOMP_IOS
             if (in_userIndex == 0 && IsInputAllowed())
             {
+                state.Gamepad.wButtons |= g_virtualGamepadButtons.load(std::memory_order_relaxed);
+
                 const bool fingerHeld = g_activeTouchFingers.load(std::memory_order_relaxed) > 0;
                 uint32_t pulse = g_touchSkipPulsePolls.load(std::memory_order_relaxed);
                 if (pulse > 0)
