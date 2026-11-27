@@ -623,11 +623,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
             XCODE_ATTRIBUTE_AD_HOC_CODE_SIGNING_ALLOWED "YES"
         )
 
-        add_custom_command(TARGET iReCompiled06 POST_BUILD
-            COMMAND /bin/sh -c "if [ ! -f \"$<TARGET_BUNDLE_DIR:iReCompiled06>/Assets.car\" ]; then /usr/bin/xcrun actool --output-format human-readable-text --notices --warnings --app-icon AppIcon --include-all-app-icons --enable-on-demand-resources NO --development-region tr --target-device iphone --target-device ipad --minimum-deployment-target 17.0 --platform iphoneos --compile \"$<TARGET_BUNDLE_DIR:iReCompiled06>\" \"${IRECOMPILED06_ASSET_CATALOG}\" --output-partial-info-plist \"${CMAKE_CURRENT_BINARY_DIR}/assetcatalog_generated_info.plist\"; fi"
-            COMMENT "Ensuring Assets.car and AppIcon are compiled into iReCompiled06.app..."
-        )
-
         set(MARATHON_IOS_MOLTENVK_FRAMEWORK "" CACHE PATH "Optional path to dynamic MoltenVK.framework (ios-arm64) to embed into iReCompiled06.app/Frameworks")
         if (MARATHON_IOS_MOLTENVK_FRAMEWORK AND EXISTS "${MARATHON_IOS_MOLTENVK_FRAMEWORK}")
             add_custom_command(TARGET iReCompiled06 POST_BUILD
