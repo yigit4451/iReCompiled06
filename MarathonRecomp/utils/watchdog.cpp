@@ -11,7 +11,7 @@
 #include <fmt/format.h>
 #include <gpu/video.h>
 #include <kernel/memory.h>
-#include <kernel/xbox.h>
+#include <xbox.h>
 #include <mutex>
 #include <os/logger.h>
 #include <thread>
