@@ -564,8 +564,14 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
             "${CMAKE_SOURCE_DIR}/ios/iReCompiled06/Bridging-Header.h"
         )
 
+        set(IRECOMPILED06_ASSET_CATALOG "${CMAKE_SOURCE_DIR}/ios/iReCompiled06/Assets.xcassets")
+        set_source_files_properties("${IRECOMPILED06_ASSET_CATALOG}" PROPERTIES
+            MACOSX_PACKAGE_LOCATION "Resources"
+        )
+
         add_executable(iReCompiled06 MACOSX_BUNDLE
             ${IRECOMPILED06_SWIFT_SOURCES}
+            "${IRECOMPILED06_ASSET_CATALOG}"
         )
 
         target_include_directories(iReCompiled06 PRIVATE
@@ -598,6 +604,9 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
             INSTALL_RPATH "@executable_path/Frameworks"
             XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.yigit4451.irecompiled06"
             XCODE_ATTRIBUTE_PRODUCT_NAME "iReCompiled06"
+            RESOURCE "${IRECOMPILED06_ASSET_CATALOG}"
+            XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
+            XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS "YES"
             XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "17.0"
             XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
             XCODE_ATTRIBUTE_INFOPLIST_KEY_UISupportedInterfaceOrientations "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
@@ -612,6 +621,11 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
             XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED "NO"
             XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY ""
             XCODE_ATTRIBUTE_AD_HOC_CODE_SIGNING_ALLOWED "YES"
+        )
+
+        add_custom_command(TARGET iReCompiled06 POST_BUILD
+            COMMAND /bin/sh -c "if [ ! -f \"$<TARGET_BUNDLE_DIR:iReCompiled06>/Assets.car\" ]; then /usr/bin/xcrun actool --output-format human-readable-text --notices --warnings --app-icon AppIcon --include-all-app-icons --enable-on-demand-resources NO --development-region tr --target-device iphone --target-device ipad --minimum-deployment-target 17.0 --platform iphoneos --compile \"$<TARGET_BUNDLE_DIR:iReCompiled06>\" \"${IRECOMPILED06_ASSET_CATALOG}\" --output-partial-info-plist \"${CMAKE_CURRENT_BINARY_DIR}/assetcatalog_generated_info.plist\"; fi"
+            COMMENT "Ensuring Assets.car and AppIcon are compiled into iReCompiled06.app..."
         )
 
         set(MARATHON_IOS_MOLTENVK_FRAMEWORK "" CACHE PATH "Optional path to dynamic MoltenVK.framework (ios-arm64) to embed into iReCompiled06.app/Frameworks")
