@@ -24,6 +24,12 @@
 #include "plume_metal.h"
 #include <bit>
 #include <cstdio>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>
+#endif
+#endif
 
 extern "C" {
     void *objc_autoreleasePoolPush(void);
@@ -39,45 +45,156 @@ namespace plume {
     static constexpr size_t VERTEX_BUFFERS_BINDING_INDEX = PUSH_CONSTANTS_BINDING_INDEX + MAX_PUSH_CONSTANT_BINDINGS;
 
     namespace {
+        static constexpr size_t MAX_DEFERRED_METAL_RESOURCES = 64;
+
         struct DeferredMetalResource {
             MetalDevice *device = nullptr;
             MTL::Resource *resource = nullptr;
             bool registeredOnDevice = false;
             bool addressable = false;
+            bool canPurge = false;
+        };
+
+        struct InFlightRetiredBatch {
+            MTL::CommandBuffer *commandBuffer = nullptr;
+            std::vector<DeferredMetalResource> resources;
+            std::atomic<bool> completed{ false };
         };
 
         std::mutex g_retiredResourcesMutex;
-        std::vector<DeferredMetalResource> g_stagingRetiredResources;
-        std::vector<DeferredMetalResource> g_readyRetiredResources;
+        std::vector<DeferredMetalResource> g_pendingRetiredResources;
+        std::vector<std::shared_ptr<InFlightRetiredBatch>> g_inFlightRetiredBatches;
         std::unordered_map<const MTL::Resource *, MetalDevice *> g_distinctTextureViewDevices;
         std::mutex g_descriptorEntriesMutex;
         std::atomic<bool> g_residencySetDirty{ false };
 
-        void deferReleaseMetalResource(MetalDevice *device, MTL::Resource *resource, bool registeredOnDevice, bool addressable) {
+        bool isIosJetsamMemoryLow() {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+            const size_t avail = os_proc_available_memory();
+            return avail > 0 && avail < (320ULL * 1024ULL * 1024ULL);
+#else
+            return false;
+#endif
+        }
+
+        void releaseDeferredMetalResource(const DeferredMetalResource &item, bool gpuCompleted) {
+            if (item.registeredOnDevice && item.device != nullptr && item.resource != nullptr) {
+                item.device->removeResource(item.resource, item.addressable);
+            }
+            if (item.resource != nullptr) {
+                if (item.canPurge && (gpuCompleted || item.resource->retainCount() <= 1)) {
+                    item.resource->setPurgeableState(MTL::PurgeableStateEmpty);
+                }
+                item.resource->release();
+            }
+        }
+
+        void flushDeferredReleases(bool trimPendingQueue) {
+            std::vector<DeferredMetalResource> completedToRelease;
+            std::vector<DeferredMetalResource> earlyToRelease;
+            std::vector<MTL::CommandBuffer *> cmdBuffersToRelease;
+            {
+                std::lock_guard<std::mutex> lock(g_retiredResourcesMutex);
+
+                auto it = g_inFlightRetiredBatches.begin();
+                while (it != g_inFlightRetiredBatches.end()) {
+                    const std::shared_ptr<InFlightRetiredBatch> &batch = *it;
+                    const bool gpuDone = (batch == nullptr) ||
+                        batch->completed.load(std::memory_order_acquire) ||
+                        (batch->commandBuffer != nullptr && batch->commandBuffer->status() >= MTL::CommandBufferStatusCompleted);
+                    if (gpuDone) {
+                        if (batch != nullptr) {
+                            if (batch->commandBuffer != nullptr) {
+                                cmdBuffersToRelease.push_back(batch->commandBuffer);
+                                batch->commandBuffer = nullptr;
+                            }
+                            for (const auto &res : batch->resources) {
+                                completedToRelease.push_back(res);
+                            }
+                            batch->resources.clear();
+                        }
+                        it = g_inFlightRetiredBatches.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+
+                const bool lowRam = isIosJetsamMemoryLow();
+                if (trimPendingQueue || lowRam || g_pendingRetiredResources.size() > MAX_DEFERRED_METAL_RESOURCES) {
+                    std::vector<DeferredMetalResource> stillPending;
+                    stillPending.reserve(std::min(g_pendingRetiredResources.size(), MAX_DEFERRED_METAL_RESOURCES));
+
+                    for (const auto &item : g_pendingRetiredResources) {
+                        if (item.resource == nullptr) {
+                            continue;
+                        }
+                        if (item.resource->retainCount() <= 1) {
+                            earlyToRelease.push_back(item);
+                        } else if (!item.addressable && (lowRam || stillPending.size() >= MAX_DEFERRED_METAL_RESOURCES)) {
+                            earlyToRelease.push_back(item);
+                        } else {
+                            stillPending.push_back(item);
+                        }
+                    }
+                    g_pendingRetiredResources.swap(stillPending);
+                }
+            }
+
+            if (!completedToRelease.empty() || !earlyToRelease.empty() || !cmdBuffersToRelease.empty()) {
+                void *pool = objc_autoreleasePoolPush();
+                for (MTL::CommandBuffer *cb : cmdBuffersToRelease) {
+                    if (cb != nullptr) {
+                        cb->release();
+                    }
+                }
+                for (const auto &item : completedToRelease) {
+                    releaseDeferredMetalResource(item, true);
+                }
+                for (const auto &item : earlyToRelease) {
+                    releaseDeferredMetalResource(item, false);
+                }
+                objc_autoreleasePoolPop(pool);
+            }
+        }
+
+        void deferReleaseMetalResource(MetalDevice *device, MTL::Resource *resource, bool registeredOnDevice, bool addressable, bool canPurge = false) {
             if (resource == nullptr) {
                 return;
             }
-            std::lock_guard<std::mutex> lock(g_retiredResourcesMutex);
-            g_stagingRetiredResources.push_back(DeferredMetalResource{
-                .device = device,
-                .resource = resource,
-                .registeredOnDevice = registeredOnDevice,
-                .addressable = addressable
-            });
+            bool shouldFlushNow = false;
+            {
+                std::lock_guard<std::mutex> lock(g_retiredResourcesMutex);
+                g_pendingRetiredResources.push_back(DeferredMetalResource{
+                    .device = device,
+                    .resource = resource,
+                    .registeredOnDevice = registeredOnDevice,
+                    .addressable = addressable,
+                    .canPurge = canPurge
+                });
+                shouldFlushNow = (g_pendingRetiredResources.size() > MAX_DEFERRED_METAL_RESOURCES);
+            }
+            if (shouldFlushNow || isIosJetsamMemoryLow()) {
+                flushDeferredReleases(true);
+            }
         }
 
-        std::shared_ptr<std::vector<DeferredMetalResource>> promoteAndTakeRetiredResourcesBatch() {
+        std::shared_ptr<InFlightRetiredBatch> attachPendingRetiredResourcesToCommandBuffer(MTL::CommandBuffer *commandBuffer) {
+            flushDeferredReleases(true);
+
             std::lock_guard<std::mutex> lock(g_retiredResourcesMutex);
-            std::shared_ptr<std::vector<DeferredMetalResource>> batchToRelease;
-            if (!g_readyRetiredResources.empty()) {
-                batchToRelease = std::make_shared<std::vector<DeferredMetalResource>>(std::move(g_readyRetiredResources));
-                g_readyRetiredResources.clear();
+            if (g_pendingRetiredResources.empty()) {
+                return nullptr;
             }
-            if (!g_stagingRetiredResources.empty()) {
-                g_readyRetiredResources = std::move(g_stagingRetiredResources);
-                g_stagingRetiredResources.clear();
+
+            auto batch = std::make_shared<InFlightRetiredBatch>();
+            if (commandBuffer != nullptr) {
+                commandBuffer->retain();
+                batch->commandBuffer = commandBuffer;
             }
-            return batchToRelease;
+            batch->resources = std::move(g_pendingRetiredResources);
+            g_pendingRetiredResources.clear();
+            g_inFlightRetiredBatches.push_back(batch);
+            return batch;
         }
     }
 
@@ -1208,7 +1325,7 @@ namespace plume {
     MetalBuffer::~MetalBuffer() {
         MetalAutoreleasePool releasePool;
         if (mtl != nullptr) {
-            deferReleaseMetalResource(device, mtl, true, addressable);
+            deferReleaseMetalResource(device, mtl, true, addressable, true);
             mtl = nullptr;
         }
     }
@@ -1579,7 +1696,7 @@ namespace plume {
     MetalTexture::~MetalTexture() {
         MetalAutoreleasePool releasePool;
         if (mtl != nullptr) {
-            deferReleaseMetalResource(device, mtl, true, false);
+            deferReleaseMetalResource(device, mtl, true, false, true);
             mtl = nullptr;
         }
     }
@@ -2212,7 +2329,7 @@ namespace plume {
         }
 
         if (argumentBuffer.mtl != nullptr) {
-            deferReleaseMetalResource(device, argumentBuffer.mtl, true, false);
+            deferReleaseMetalResource(device, argumentBuffer.mtl, true, false, true);
             argumentBuffer.mtl = nullptr;
         }
     }
@@ -4280,6 +4397,8 @@ namespace plume {
 
         MetalAutoreleasePool releasePool;
 
+        flushDeferredReleases(false);
+
         // Ensure any pending MTLResidencySet mutations are committed before enqueuing/committing command buffers.
         if (device != nullptr && device->residencySet != nullptr && g_residencySetDirty.exchange(false, std::memory_order_acq_rel)) {
             std::lock_guard lock(device->resourcesMutex);
@@ -4313,7 +4432,7 @@ namespace plume {
         const MetalCommandList *interfaceCommandList = static_cast<const MetalCommandList *>(commandLists[commandListCount - 1]);
         interfaceCommandList->mtl->enqueue();
 
-        std::shared_ptr<std::vector<DeferredMetalResource>> retiredBatch = promoteAndTakeRetiredResourcesBatch();
+        std::shared_ptr<InFlightRetiredBatch> retiredBatch = attachPendingRetiredResourcesToCommandBuffer(interfaceCommandList->mtl);
 
         interfaceCommandList->mtl->addCompletedHandler([signalFence, retiredBatch](MTL::CommandBuffer* buffer) {
             MetalAutoreleasePool handlerPool;
@@ -4327,15 +4446,9 @@ namespace plume {
                 appendMetalFreezeLog(msg);
             }
             if (retiredBatch != nullptr) {
-                for (const auto &item : *retiredBatch) {
-                    if (item.registeredOnDevice && item.device != nullptr) {
-                        item.device->removeResource(item.resource, item.addressable);
-                    }
-                    if (item.resource != nullptr) {
-                        item.resource->release();
-                    }
-                }
+                retiredBatch->completed.store(true, std::memory_order_release);
             }
+            flushDeferredReleases(false);
             if (signalFence != nullptr) {
                 dispatch_semaphore_signal(static_cast<MetalCommandFence *>(signalFence)->semaphore);
             }

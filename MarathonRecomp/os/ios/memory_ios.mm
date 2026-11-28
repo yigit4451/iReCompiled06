@@ -10,13 +10,17 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <dispatch/dispatch.h>
+#include <fcntl.h>
 #include <mutex>
 #include <os/proc.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace
@@ -34,6 +38,111 @@ namespace
     std::once_flag g_faultHandlerOnceFlag;
     struct sigaction g_prevSigbusAction{};
     struct sigaction g_prevSigsegvAction{};
+    struct sigaction g_prevSigabrtAction{};
+    char g_crashLogPath[1024] = {};
+    std::atomic_flag g_fatalSignalLogged = ATOMIC_FLAG_INIT;
+
+    void InitCrashLogPathIfNeeded()
+    {
+        if (g_crashLogPath[0] != '\0')
+            return;
+
+        const char* home = std::getenv("HOME");
+        if (home != nullptr && home[0] != '\0')
+        {
+            char dirPath[1024];
+            std::snprintf(dirPath, sizeof(dirPath), "%s/Documents/iReCompiled06", home);
+            mkdir(dirPath, 0755);
+            std::snprintf(g_crashLogPath, sizeof(g_crashLogPath), "%s/Documents/iReCompiled06/freeze_log.txt", home);
+        }
+    }
+
+    const char* GetFatalSignalName(int sig)
+    {
+        switch (sig)
+        {
+            case SIGSEGV: return "SIGSEGV";
+            case SIGBUS:  return "SIGBUS";
+            case SIGABRT: return "SIGABRT";
+            default:      return "SIGNAL";
+        }
+    }
+
+    size_t AppendSignalText(char* buf, size_t cap, size_t pos, const char* text)
+    {
+        if (text == nullptr)
+            return pos;
+        while (*text != '\0' && pos + 1 < cap)
+            buf[pos++] = *text++;
+        return pos;
+    }
+
+    size_t AppendSignalUint(char* buf, size_t cap, size_t pos, uint64_t val)
+    {
+        char tmp[24];
+        size_t n = 0;
+        do
+        {
+            tmp[n++] = static_cast<char>('0' + (val % 10ULL));
+            val /= 10ULL;
+        } while (val > 0 && n < sizeof(tmp));
+
+        while (n > 0 && pos + 1 < cap)
+            buf[pos++] = tmp[--n];
+        return pos;
+    }
+
+    size_t AppendSignalHex(char* buf, size_t cap, size_t pos, uint64_t val)
+    {
+        static constexpr char kHex[] = "0123456789abcdef";
+        pos = AppendSignalText(buf, cap, pos, "0x");
+        char tmp[16];
+        size_t n = 0;
+        do
+        {
+            tmp[n++] = kHex[val & 0xFULL];
+            val >>= 4U;
+        } while (val > 0 && n < sizeof(tmp));
+
+        while (n > 0 && pos + 1 < cap)
+            buf[pos++] = tmp[--n];
+        return pos;
+    }
+
+    void WriteFatalSignalFreezeLog(int sig, siginfo_t* info)
+    {
+        if (g_fatalSignalLogged.test_and_set(std::memory_order_acq_rel))
+            return;
+
+        const uintptr_t crashAddr = (info != nullptr) ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
+        const uint64_t availBytes = static_cast<uint64_t>(os_proc_available_memory());
+
+        char line[256];
+        size_t pos = 0;
+        pos = AppendSignalText(line, sizeof(line), pos, "[FATAL SIGNAL] sig=");
+        pos = AppendSignalUint(line, sizeof(line), pos, static_cast<uint64_t>(sig > 0 ? sig : 0));
+        pos = AppendSignalText(line, sizeof(line), pos, " (");
+        pos = AppendSignalText(line, sizeof(line), pos, GetFatalSignalName(sig));
+        pos = AppendSignalText(line, sizeof(line), pos, ") si_addr=");
+        pos = AppendSignalHex(line, sizeof(line), pos, static_cast<uint64_t>(crashAddr));
+        pos = AppendSignalText(line, sizeof(line), pos, " avail_ram=");
+        pos = AppendSignalUint(line, sizeof(line), pos, availBytes / MiB);
+        pos = AppendSignalText(line, sizeof(line), pos, " MiB (");
+        pos = AppendSignalUint(line, sizeof(line), pos, availBytes);
+        pos = AppendSignalText(line, sizeof(line), pos, " bytes)\n");
+
+        (void)write(STDERR_FILENO, line, pos);
+
+        if (g_crashLogPath[0] != '\0')
+        {
+            const int fd = open(g_crashLogPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0)
+            {
+                (void)write(fd, line, pos);
+                close(fd);
+            }
+        }
+    }
 
     void ForwardUnhandledSignal(int sig, siginfo_t* info, void* ucontext, const struct sigaction& prev)
     {
@@ -60,7 +169,7 @@ namespace
 
     void GuestMemorySignalHandler(int sig, siginfo_t* info, void* ucontext)
     {
-        if (info != nullptr)
+        if ((sig == SIGBUS || sig == SIGSEGV) && info != nullptr)
         {
             const uintptr_t base = g_guestFaultBase.load(std::memory_order_relaxed);
             const size_t size = g_guestFaultSize.load(std::memory_order_relaxed);
@@ -79,7 +188,28 @@ namespace
             }
         }
 
-        ForwardUnhandledSignal(sig, info, ucontext, sig == SIGBUS ? g_prevSigbusAction : g_prevSigsegvAction);
+        WriteFatalSignalFreezeLog(sig, info);
+
+        const struct sigaction& prev = (sig == SIGBUS)
+            ? g_prevSigbusAction
+            : ((sig == SIGABRT) ? g_prevSigabrtAction : g_prevSigsegvAction);
+        ForwardUnhandledSignal(sig, info, ucontext, prev);
+    }
+
+    void EnsureSignalHandlersInstalled()
+    {
+        InitCrashLogPathIfNeeded();
+        std::call_once(g_faultHandlerOnceFlag, []()
+        {
+            struct sigaction act{};
+            act.sa_sigaction = GuestMemorySignalHandler;
+            sigemptyset(&act.sa_mask);
+            act.sa_flags = SA_SIGINFO | SA_NODEFER;
+
+            sigaction(SIGBUS, &act, &g_prevSigbusAction);
+            sigaction(SIGSEGV, &act, &g_prevSigsegvAction);
+            sigaction(SIGABRT, &act, &g_prevSigabrtAction);
+        });
     }
 
     os::ios::MemoryBudget ComputeMemoryBudget()
@@ -194,6 +324,7 @@ void os::ios::ConfigureMoltenVKMemoryPool()
 
 void os::ios::InstallMemoryWarningObserver()
 {
+    EnsureSignalHandlersInstalled();
     std::call_once(g_observerOnceFlag, []()
     {
         @autoreleasepool
@@ -258,6 +389,8 @@ bool os::ios::SupportsNativeBCTextures()
 
 void os::ios::InstallGuestMemoryFaultHandler(uint8_t* guestBase, size_t guestSize, size_t pageSize)
 {
+    EnsureSignalHandlersInstalled();
+
     if (guestBase == nullptr || guestSize == 0)
         return;
 
@@ -265,17 +398,6 @@ void os::ios::InstallGuestMemoryFaultHandler(uint8_t* guestBase, size_t guestSiz
     g_guestFaultPageSize.store(safePageSize, std::memory_order_release);
     g_guestFaultSize.store(guestSize, std::memory_order_release);
     g_guestFaultBase.store(reinterpret_cast<uintptr_t>(guestBase), std::memory_order_release);
-
-    std::call_once(g_faultHandlerOnceFlag, []()
-    {
-        struct sigaction act{};
-        act.sa_sigaction = GuestMemorySignalHandler;
-        sigemptyset(&act.sa_mask);
-        act.sa_flags = SA_SIGINFO | SA_NODEFER;
-
-        sigaction(SIGBUS, &act, &g_prevSigbusAction);
-        sigaction(SIGSEGV, &act, &g_prevSigsegvAction);
-    });
 }
 
 void os::ios::ConfigureMetalLayer(void* metalLayer)
