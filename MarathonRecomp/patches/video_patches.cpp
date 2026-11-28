@@ -403,11 +403,19 @@ static constexpr uint32_t XMV_EOF_RESULT = 0x16660026; // XMEDIA_W_EOF = (5734 <
 static constexpr uint32_t XMV_STATE_FINISHED = 7;
 static std::atomic<uint32_t> g_xmvAbortedPlayer{ 0 };
 static std::atomic<uint32_t> g_activeXmvPlayer{ 0 };
+static std::atomic<uint32_t> g_lastSeenXmvPlayer{ 0 };
 static std::atomic<uint64_t> g_xmvAbortDrainUntilMs{ 0 };
 
 // Track CCalXmvPlayer* passed into CCalXmvPlayer::GetStatus (sub_82733640) so we can mute/quiesce its XAudioSourceVoice
 // before MovieObjectWmv::Update destroys the player on EOF.
 static std::atomic<uint32_t> g_lastCalXmvPlayer{ 0 };
+
+static void XmvResetAbortForNewMovie()
+{
+    g_xmvAbortRequested.store(false, std::memory_order_release);
+    g_xmvAbortedPlayer.store(0, std::memory_order_release);
+    g_xmvAbortDrainUntilMs.store(0, std::memory_order_release);
+}
 
 static void XmvQuiesceCalAudioVoice(uint8_t* base, uint32_t calPlayerAddr)
 {
@@ -434,7 +442,7 @@ static void XmvQuiesceCalAudioVoice(uint8_t* base, uint32_t calPlayerAddr)
 
 static void XmvFinishPlayer(uint8_t* base, uint32_t player)
 {
-    g_xmvAbortDrainUntilMs.store(XmvNowMs() + 3000u, std::memory_order_release);
+    g_xmvAbortDrainUntilMs.store(XmvNowMs() + 1500u, std::memory_order_release);
 
     if (base == nullptr || player < 0x10000u)
         return;
@@ -482,8 +490,6 @@ static void XmvFinishPlayer(uint8_t* base, uint32_t player)
 
 void XmvForceAbortActivePlayer()
 {
-    g_xmvAbortDrainUntilMs.store(XmvNowMs() + 3000u, std::memory_order_release);
-
     if (g_memory.base == nullptr)
         return;
 
@@ -492,12 +498,14 @@ void XmvForceAbortActivePlayer()
     {
         g_xmvAbortedPlayer.store(player, std::memory_order_release);
         XmvFinishPlayer(g_memory.base, player);
+        // Once the active player is marked in g_xmvAbortedPlayer, clear g_xmvAbortRequested so it cannot
+        // persist into subsequent videos (e.g. the Title Screen background video).
+        g_xmvAbortRequested.store(false, std::memory_order_release);
     }
     else
     {
-        const uint32_t calPlayer = g_lastCalXmvPlayer.load(std::memory_order_relaxed);
-        if (calPlayer >= 0x10000u)
-            XmvQuiesceCalAudioVoice(g_memory.base, calPlayer);
+        // No active XMV player is running; clear any pending abort request so the next video starts cleanly.
+        g_xmvAbortRequested.store(false, std::memory_order_release);
     }
 }
 
@@ -505,11 +513,13 @@ PPC_FUNC_IMPL(__imp__sub_82743680);
 PPC_FUNC(sub_82743680)
 {
     const uint32_t player = ctx.r3.u32;
-    const uint32_t prevActive = g_activeXmvPlayer.load(std::memory_order_acquire);
     if (player >= 0x10000u)
     {
-        if (prevActive != 0 && prevActive != player)
-            g_xmvAbortDrainUntilMs.store(0, std::memory_order_release);
+        const uint32_t prevSeen = g_lastSeenXmvPlayer.exchange(player, std::memory_order_acq_rel);
+        // Any newly created XMV player (such as the Title Screen background loop) resets stale abort flags.
+        if (prevSeen != 0 && prevSeen != player)
+            XmvResetAbortForNewMovie();
+
         g_activeXmvPlayer.store(player, std::memory_order_release);
     }
 
@@ -518,9 +528,7 @@ PPC_FUNC(sub_82743680)
     // A different player means a new movie started; forget the previous abort cleanly.
     if (prevAborted != 0 && prevAborted != player)
     {
-        g_xmvAbortedPlayer.store(0, std::memory_order_release);
-        g_xmvAbortRequested.store(false, std::memory_order_release);
-        g_xmvAbortDrainUntilMs.store(0, std::memory_order_release);
+        XmvResetAbortForNewMovie();
     }
 
     if (g_xmvAbortedPlayer.load(std::memory_order_acquire) == player && player != 0)
@@ -555,15 +563,20 @@ PPC_FUNC(sub_82733640)
     const uint32_t pStatus = ctx.r4.u32;
 
     if (calPlayer >= 0x10000u)
-        g_lastCalXmvPlayer.store(calPlayer, std::memory_order_relaxed);
+    {
+        const uint32_t prevCal = g_lastCalXmvPlayer.exchange(calPlayer, std::memory_order_acq_rel);
+        if (prevCal != 0 && prevCal != calPlayer)
+            XmvResetAbortForNewMovie();
+    }
 
     if (g_xmvAbortedPlayer.load(std::memory_order_acquire) != 0 && pStatus >= 0x10000u)
     {
-        g_xmvAbortDrainUntilMs.store(XmvNowMs() + 3000u, std::memory_order_release);
+        g_xmvAbortDrainUntilMs.store(XmvNowMs() + 1500u, std::memory_order_release);
         XmvQuiesceCalAudioVoice(base, calPlayer);
         *reinterpret_cast<be<uint32_t>*>(base + pStatus) = XMV_STATE_FINISHED;
-        // Clear g_xmvAbortedPlayer after reporting FINISHED so MovieObjectWmv::Update tears down this movie
-        // once and future movies start fresh.
+        // Clear abort flags after reporting FINISHED so MovieObjectWmv::Update tears down this movie
+        // once and the Title Screen background video starts with g_xmvAbortRequested == false.
+        g_xmvAbortRequested.store(false, std::memory_order_release);
         g_xmvAbortedPlayer.store(0, std::memory_order_release);
         g_activeXmvPlayer.store(0, std::memory_order_release);
         ctx.r3.u32 = 0;

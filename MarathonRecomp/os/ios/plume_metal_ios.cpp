@@ -4139,6 +4139,32 @@ namespace plume {
         return std::make_unique<MetalSwapChain>(this, desc);
     }
 
+    namespace {
+        void appendMetalFreezeLog(const char *message) {
+            if (message == nullptr) {
+                return;
+            }
+            static std::mutex s_metalLogMutex;
+            std::lock_guard<std::mutex> lock(s_metalLogMutex);
+            const char *home = getenv("HOME");
+            if (home == nullptr || home[0] == '\0') {
+                return;
+            }
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/Documents/iReCompiled06/freeze_log.txt", home);
+            FILE *fp = fopen(path, "a");
+            if (fp == nullptr) {
+                snprintf(path, sizeof(path), "%s/Documents/freeze_log.txt", home);
+                fp = fopen(path, "a");
+            }
+            if (fp != nullptr) {
+                fprintf(fp, "%s\n", message);
+                fflush(fp);
+                fclose(fp);
+            }
+        }
+    }
+
     void MetalCommandQueue::executeCommandLists(const RenderCommandList **commandLists, const uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores, const uint32_t waitSemaphoreCount, RenderCommandSemaphore **signalSemaphores, const uint32_t signalSemaphoreCount, RenderCommandFence *signalFence) {
         assert(commandLists != nullptr);
         assert(commandListCount > 0);
@@ -4171,11 +4197,20 @@ namespace plume {
         const MetalCommandList *interfaceCommandList = static_cast<const MetalCommandList *>(commandLists[commandListCount - 1]);
         interfaceCommandList->mtl->enqueue();
 
-        if (signalFence != nullptr) {
-            interfaceCommandList->mtl->addCompletedHandler([signalFence](MTL::CommandBuffer* cmdBuffer) {
+        interfaceCommandList->mtl->addCompletedHandler([signalFence](MTL::CommandBuffer* buffer) {
+            if (buffer != nullptr && buffer->status() == MTL::CommandBufferStatusError) {
+                const char *errDesc = (buffer->error() != nullptr && buffer->error()->localizedDescription() != nullptr)
+                    ? buffer->error()->localizedDescription()->utf8String()
+                    : "unknown Metal command buffer error";
+                char msg[1024];
+                snprintf(msg, sizeof(msg), "[METAL CB ERROR] CommandBufferStatusError: %s", errDesc != nullptr ? errDesc : "unknown");
+                fprintf(stderr, "%s\n", msg);
+                appendMetalFreezeLog(msg);
+            }
+            if (signalFence != nullptr) {
                 dispatch_semaphore_signal(static_cast<MetalCommandFence *>(signalFence)->semaphore);
-            });
-        }
+            }
+        });
 
         for (uint32_t i = 0; i < signalSemaphoreCount; i++) {
             const MetalCommandSemaphore *interfaceSemaphore = static_cast<MetalCommandSemaphore *>(signalSemaphores[i]);
@@ -4189,9 +4224,11 @@ namespace plume {
     void MetalCommandQueue::waitForCommandFence(RenderCommandFence *fence) {
         MetalAutoreleasePool releasePool;
         const MetalCommandFence *metalFence = static_cast<MetalCommandFence *>(fence);
-        const dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC);
+        const dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 250LL * 1000000LL);
         if (dispatch_semaphore_wait(metalFence->semaphore, timeout) != 0) {
-            fprintf(stderr, "[plume_metal_ios] Warning: MetalCommandFence timed out after 3s (GPU command buffer stall/reset); continuing.\n");
+            const char *msg = "[METAL FENCE TIMEOUT] MetalCommandFence timed out after 250ms (GPU command buffer stall/reset); continuing.";
+            fprintf(stderr, "%s\n", msg);
+            appendMetalFreezeLog(msg);
         }
     }
 
