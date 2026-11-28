@@ -15,10 +15,13 @@
 #include <CoreFoundation/CoreFoundation.h>
 
 #include <algorithm>
+#include <atomic>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include "plume_metal.h"
-#include <algorithm>
 #include <bit>
 #include <cstdio>
 
@@ -34,6 +37,49 @@ namespace plume {
     static constexpr size_t DESCRIPTOR_SETS_BINDING_INDEX = 0;
     static constexpr size_t PUSH_CONSTANTS_BINDING_INDEX = DESCRIPTOR_SETS_BINDING_INDEX + MAX_DESCRIPTOR_SET_BINDINGS;
     static constexpr size_t VERTEX_BUFFERS_BINDING_INDEX = PUSH_CONSTANTS_BINDING_INDEX + MAX_PUSH_CONSTANT_BINDINGS;
+
+    namespace {
+        struct DeferredMetalResource {
+            MetalDevice *device = nullptr;
+            MTL::Resource *resource = nullptr;
+            bool registeredOnDevice = false;
+            bool addressable = false;
+        };
+
+        std::mutex g_retiredResourcesMutex;
+        std::vector<DeferredMetalResource> g_stagingRetiredResources;
+        std::vector<DeferredMetalResource> g_readyRetiredResources;
+        std::unordered_map<const MTL::Resource *, MetalDevice *> g_distinctTextureViewDevices;
+        std::mutex g_descriptorEntriesMutex;
+        std::atomic<bool> g_residencySetDirty{ false };
+
+        void deferReleaseMetalResource(MetalDevice *device, MTL::Resource *resource, bool registeredOnDevice, bool addressable) {
+            if (resource == nullptr) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(g_retiredResourcesMutex);
+            g_stagingRetiredResources.push_back(DeferredMetalResource{
+                .device = device,
+                .resource = resource,
+                .registeredOnDevice = registeredOnDevice,
+                .addressable = addressable
+            });
+        }
+
+        std::shared_ptr<std::vector<DeferredMetalResource>> promoteAndTakeRetiredResourcesBatch() {
+            std::lock_guard<std::mutex> lock(g_retiredResourcesMutex);
+            std::shared_ptr<std::vector<DeferredMetalResource>> batchToRelease;
+            if (!g_readyRetiredResources.empty()) {
+                batchToRelease = std::make_shared<std::vector<DeferredMetalResource>>(std::move(g_readyRetiredResources));
+                g_readyRetiredResources.clear();
+            }
+            if (!g_stagingRetiredResources.empty()) {
+                g_readyRetiredResources = std::move(g_stagingRetiredResources);
+                g_stagingRetiredResources.clear();
+            }
+            return batchToRelease;
+        }
+    }
 
     // MARK: - Prototypes
 
@@ -1154,13 +1200,17 @@ namespace plume {
         this->mtl = device->mtl->newBuffer(desc.size, mapResourceOption(desc.heapType));
 
         addressable = desc.flags & RenderBufferFlag::DEVICE_ADDRESSABLE;
-        device->addResource(mtl, addressable);
+        if (this->mtl != nullptr) {
+            device->addResource(mtl, addressable);
+        }
     }
 
     MetalBuffer::~MetalBuffer() {
         MetalAutoreleasePool releasePool;
-        device->removeResource(mtl, addressable);
-        mtl->release();
+        if (mtl != nullptr) {
+            deferReleaseMetalResource(device, mtl, true, addressable);
+            mtl = nullptr;
+        }
     }
 
     void* MetalBuffer::map(uint32_t subresource, const RenderRange* readRange) {
@@ -1217,11 +1267,17 @@ namespace plume {
         // Create texture with configured descriptor and alignment
         MTL::TextureDescriptor *descriptor = MTL::TextureDescriptor::textureBufferDescriptor(pixelFormat, width, options, usage);
         this->texture = buffer->mtl->newTexture(descriptor, 0, bytesPerRow);
+        if (this->texture != nullptr && buffer->device != nullptr) {
+            buffer->device->addResource(this->texture, false);
+        }
     }
 
     MetalBufferFormattedView::~MetalBufferFormattedView() {
         MetalAutoreleasePool releasePool;
-        texture->release();
+        if (texture != nullptr) {
+            deferReleaseMetalResource(buffer != nullptr ? buffer->device : nullptr, texture, buffer != nullptr && buffer->device != nullptr, false);
+            texture = nullptr;
+        }
     }
 
     namespace {
@@ -1523,8 +1579,8 @@ namespace plume {
     MetalTexture::~MetalTexture() {
         MetalAutoreleasePool releasePool;
         if (mtl != nullptr) {
-            device->removeResource(mtl);
-            mtl->release();
+            deferReleaseMetalResource(device, mtl, true, false);
+            mtl = nullptr;
         }
     }
 
@@ -1702,12 +1758,28 @@ namespace plume {
                          static_cast<unsigned long>(actualParentSlices));
             this->texture = texture->mtl->retain();
         }
+
+        if (this->texture != nullptr && this->texture != texture->mtl && texture->device != nullptr) {
+            texture->device->addResource(this->texture, false);
+            std::lock_guard<std::mutex> lock(g_retiredResourcesMutex);
+            g_distinctTextureViewDevices[this->texture] = texture->device;
+        }
     }
 
     MetalTextureView::~MetalTextureView() {
         MetalAutoreleasePool releasePool;
         if (texture != nullptr) {
-            texture->release();
+            MetalDevice *registeredDevice = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_retiredResourcesMutex);
+                auto it = g_distinctTextureViewDevices.find(texture);
+                if (it != g_distinctTextureViewDevices.end()) {
+                    registeredDevice = it->second;
+                    g_distinctTextureViewDevices.erase(it);
+                }
+            }
+            deferReleaseMetalResource(registeredDevice, texture, registeredDevice != nullptr, false);
+            texture = nullptr;
         }
     }
 
@@ -2115,6 +2187,9 @@ namespace plume {
             .argumentEncoder = setLayout->argumentEncoder,
             .offset = 0,
         };
+        if (argumentBuffer.mtl != nullptr) {
+            device->addResource(argumentBuffer.mtl, false);
+        }
 
         if (!device->useArgumentBuffersTier2 || !device->useDirectBufferAddresses) {
             argumentBuffer.argumentEncoder->setArgumentBuffer(argumentBuffer.mtl, argumentBuffer.offset);
@@ -2126,14 +2201,19 @@ namespace plume {
 
     MetalDescriptorSet::~MetalDescriptorSet() {
         MetalAutoreleasePool releasePool;
-        for (const auto &entry : resourceEntries) {
-            if (entry.resource != nullptr) {
-                entry.resource->release();
+        {
+            std::lock_guard<std::mutex> lock(g_descriptorEntriesMutex);
+            for (auto &entry : resourceEntries) {
+                if (entry.resource != nullptr) {
+                    deferReleaseMetalResource(device, entry.resource, false, false);
+                    entry.resource = nullptr;
+                }
             }
         }
 
         if (argumentBuffer.mtl != nullptr) {
-            argumentBuffer.mtl->release();
+            deferReleaseMetalResource(device, argumentBuffer.mtl, true, false);
+            argumentBuffer.mtl = nullptr;
         }
     }
 
@@ -2289,13 +2369,16 @@ namespace plume {
             argumentBuffer.mtl->didModifyRange(NS::Range(argumentBuffer.offset, argumentBuffer.mtl->length() - argumentBuffer.offset));
         }
 
-        MTL::Resource *oldResource = resourceEntries[descriptorIndex].resource;
-        if (oldResource != nullptr) {
-            oldResource->release();
+        MTL::Resource *oldResource = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_descriptorEntriesMutex);
+            oldResource = resourceEntries[descriptorIndex].resource;
+            resourceEntries[descriptorIndex].resource = nativeResource;
+            resourceEntries[descriptorIndex].type = descriptorType;
         }
-
-        resourceEntries[descriptorIndex].resource = nativeResource;
-        resourceEntries[descriptorIndex].type = descriptorType;
+        if (oldResource != nullptr) {
+            deferReleaseMetalResource(device, oldResource, false, false);
+        }
     }
 
     RenderDescriptorRangeType MetalDescriptorSet::getDescriptorType(const uint32_t binding) const {
@@ -2364,7 +2447,7 @@ namespace plume {
         assert(drawable.mtl != nullptr && "Cannot present without a valid drawable.");
 
         // Create a new command buffer just for presenting
-        MTL::CommandBuffer *presentBuffer = commandQueue->mtl->commandBufferWithUnretainedReferences();
+        MTL::CommandBuffer *presentBuffer = commandQueue->mtl->commandBuffer();
         presentBuffer->setLabel(MTLSTR("Present Command Buffer"));
         presentBuffer->enqueue();
 
@@ -2680,7 +2763,7 @@ namespace plume {
 
         MetalAutoreleasePool releasePool;
         startedEncoding = false;
-        mtl = queue->mtl->commandBufferWithUnretainedReferences();
+        mtl = queue->mtl->commandBuffer();
         mtl->retain();
         mtl->setLabel(MTLSTR("RT64 Command List"));
 
@@ -2929,6 +3012,7 @@ namespace plume {
         MetalAutoreleasePool releasePool;
         checkActiveRenderEncoder();
         checkForUpdatesInGraphicsState();
+        activeRenderEncoder->useResource(indexBuffer, MTL::ResourceUsageRead, MTL::RenderStageVertex);
 
         activeRenderEncoder->drawIndexedPrimitives(currentPrimitiveType, indexCountPerInstance, currentIndexType, indexBuffer, indexBufferOffset + (startIndexLocation * indexTypeSize), instanceCount, baseVertexLocation, startInstanceLocation);
     }
@@ -3944,6 +4028,9 @@ namespace plume {
             while (vertexBufferSlots > 0) {
                 const uint32_t i = __builtin_ctzll(vertexBufferSlots);
                 activeRenderEncoder->setVertexBuffer(vertexBuffers[i], vertexBufferOffsets[i], VERTEX_BUFFERS_BINDING_INDEX + i);
+                if (vertexBuffers[i] != nullptr) {
+                    activeRenderEncoder->useResource(vertexBuffers[i], MTL::ResourceUsageRead, MTL::RenderStageVertex);
+                }
                 vertexBufferSlots &= ~(1U << i);
             }
             dirtyGraphicsState.vertexBufferSlots = 0;
@@ -4053,15 +4140,22 @@ namespace plume {
             {
                 std::lock_guard lock(device->resourcesMutex);
                 for (const auto* resource : device->gpuAddressableResources) {
-                    computeEncoder->useResource(resource, MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+                    if (resource != nullptr) {
+                        computeEncoder->useResource(resource, MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+                    }
                 }
             }
-            if (device->residencySet == nullptr) {
-                for (const auto* descriptorSet : currentEncoderDescriptorSets) {
-                    for (const auto& entry : descriptorSet->resourceEntries) {
-                        if (entry.resource != nullptr) {
-                            computeEncoder->useResource(entry.resource, mapResourceUsage(entry.type));
-                        }
+            for (const auto* descriptorSet : currentEncoderDescriptorSets) {
+                if (descriptorSet == nullptr) {
+                    continue;
+                }
+                if (descriptorSet->argumentBuffer.mtl != nullptr) {
+                    computeEncoder->useResource(descriptorSet->argumentBuffer.mtl, MTL::ResourceUsageRead);
+                }
+                std::lock_guard<std::mutex> entryLock(g_descriptorEntriesMutex);
+                for (const auto& entry : descriptorSet->resourceEntries) {
+                    if (entry.resource != nullptr) {
+                        computeEncoder->useResource(entry.resource, mapResourceUsage(entry.type));
                     }
                 }
             }
@@ -4070,15 +4164,30 @@ namespace plume {
             {
                 std::lock_guard lock(device->resourcesMutex);
                 for (const auto* resource : device->gpuAddressableResources) {
-                    renderEncoder->useResource(resource, MTL::ResourceUsageRead | MTL::ResourceUsageWrite, MTL::RenderStageVertex | MTL::RenderStageFragment);
+                    if (resource != nullptr) {
+                        renderEncoder->useResource(resource, MTL::ResourceUsageRead | MTL::ResourceUsageWrite, MTL::RenderStageVertex | MTL::RenderStageFragment);
+                    }
                 }
             }
-            if (device->residencySet == nullptr) {
-                for (const auto* descriptorSet : currentEncoderDescriptorSets) {
-                    for (const auto& entry : descriptorSet->resourceEntries) {
-                        if (entry.resource != nullptr) {
-                            renderEncoder->useResource(entry.resource, mapResourceUsage(entry.type), MTL::RenderStageVertex | MTL::RenderStageFragment);
-                        }
+            for (uint32_t i = 0; i < MAX_VERTEX_BUFFER_BINDINGS; i++) {
+                if (vertexBuffers[i] != nullptr) {
+                    renderEncoder->useResource(vertexBuffers[i], MTL::ResourceUsageRead, MTL::RenderStageVertex);
+                }
+            }
+            if (indexBuffer != nullptr) {
+                renderEncoder->useResource(indexBuffer, MTL::ResourceUsageRead, MTL::RenderStageVertex);
+            }
+            for (const auto* descriptorSet : currentEncoderDescriptorSets) {
+                if (descriptorSet == nullptr) {
+                    continue;
+                }
+                if (descriptorSet->argumentBuffer.mtl != nullptr) {
+                    renderEncoder->useResource(descriptorSet->argumentBuffer.mtl, MTL::ResourceUsageRead, MTL::RenderStageVertex | MTL::RenderStageFragment);
+                }
+                std::lock_guard<std::mutex> entryLock(g_descriptorEntriesMutex);
+                for (const auto& entry : descriptorSet->resourceEntries) {
+                    if (entry.resource != nullptr) {
+                        renderEncoder->useResource(entry.resource, mapResourceUsage(entry.type), MTL::RenderStageVertex | MTL::RenderStageFragment);
                     }
                 }
             }
@@ -4169,9 +4278,16 @@ namespace plume {
         assert(commandLists != nullptr);
         assert(commandListCount > 0);
 
-        // Create a new command buffer to encode the wait semaphores into
         MetalAutoreleasePool releasePool;
-        MTL::CommandBuffer* cmdBuffer = mtl->commandBufferWithUnretainedReferences();
+
+        // Ensure any pending MTLResidencySet mutations are committed before enqueuing/committing command buffers.
+        if (device != nullptr && device->residencySet != nullptr && g_residencySetDirty.exchange(false, std::memory_order_acq_rel)) {
+            std::lock_guard lock(device->resourcesMutex);
+            device->residencySet->commit();
+        }
+
+        // Create a new command buffer to encode the wait semaphores into
+        MTL::CommandBuffer* cmdBuffer = mtl->commandBuffer();
         cmdBuffer->setLabel(MTLSTR("Wait Command Buffer"));
         cmdBuffer->enqueue();
 
@@ -4193,11 +4309,14 @@ namespace plume {
             mutableCommandList->commit();
         }
 
-        // Use the last command list to mark the end and signal the fence
+        // Use the last command list to mark the end, release retired resources after GPU completion, and signal the fence
         const MetalCommandList *interfaceCommandList = static_cast<const MetalCommandList *>(commandLists[commandListCount - 1]);
         interfaceCommandList->mtl->enqueue();
 
-        interfaceCommandList->mtl->addCompletedHandler([signalFence](MTL::CommandBuffer* buffer) {
+        std::shared_ptr<std::vector<DeferredMetalResource>> retiredBatch = promoteAndTakeRetiredResourcesBatch();
+
+        interfaceCommandList->mtl->addCompletedHandler([signalFence, retiredBatch](MTL::CommandBuffer* buffer) {
+            MetalAutoreleasePool handlerPool;
             if (buffer != nullptr && buffer->status() == MTL::CommandBufferStatusError) {
                 const char *errDesc = (buffer->error() != nullptr && buffer->error()->localizedDescription() != nullptr)
                     ? buffer->error()->localizedDescription()->utf8String()
@@ -4206,6 +4325,16 @@ namespace plume {
                 snprintf(msg, sizeof(msg), "[METAL CB ERROR] CommandBufferStatusError: %s", errDesc != nullptr ? errDesc : "unknown");
                 fprintf(stderr, "%s\n", msg);
                 appendMetalFreezeLog(msg);
+            }
+            if (retiredBatch != nullptr) {
+                for (const auto &item : *retiredBatch) {
+                    if (item.registeredOnDevice && item.device != nullptr) {
+                        item.device->removeResource(item.resource, item.addressable);
+                    }
+                    if (item.resource != nullptr) {
+                        item.resource->release();
+                    }
+                }
             }
             if (signalFence != nullptr) {
                 dispatch_semaphore_signal(static_cast<MetalCommandFence *>(signalFence)->semaphore);
@@ -4246,6 +4375,7 @@ namespace plume {
     MetalPipelineLayout::~MetalPipelineLayout() {}
 
     void MetalPipelineLayout::bindDescriptorSets(MTL::CommandEncoder* encoder, const MetalDescriptorSet* const* descriptorSets, uint32_t descriptorSetCount, bool isCompute, uint32_t startIndex, std::unordered_set<MetalDescriptorSet*>& encoderDescriptorSets, bool usingResidencySets) const {
+        (void)usingResidencySets;
         for (uint32_t i = startIndex; i < setLayoutCount; i++) {
             if (i >= descriptorSetCount || descriptorSets[i] == nullptr) {
                 continue;
@@ -4254,10 +4384,8 @@ namespace plume {
             const MetalDescriptorSet* descriptorSet = descriptorSets[i];
             const MetalArgumentBuffer& descriptorBuffer = descriptorSet->argumentBuffer;
 
-            if (!usingResidencySets) {
-                // Track descriptor set for later resource binding
-                encoderDescriptorSets.insert(const_cast<MetalDescriptorSet*>(descriptorSet));
-            }
+            // Always track descriptor set so bindEncoderResources marks all active textures & buffers resident via useResource.
+            encoderDescriptorSets.insert(const_cast<MetalDescriptorSet*>(descriptorSet));
 
             // Bind argument buffer
             if (isCompute) {
@@ -4390,6 +4518,32 @@ namespace plume {
         sharedBlitDescriptor->release();
 
         nullBuffer.reset();
+
+        std::vector<DeferredMetalResource> pendingToFlush;
+        {
+            std::lock_guard<std::mutex> lock(g_retiredResourcesMutex);
+            auto drainList = [this, &pendingToFlush](std::vector<DeferredMetalResource> &list) {
+                auto it = list.begin();
+                while (it != list.end()) {
+                    if (it->device == this || it->device == nullptr) {
+                        pendingToFlush.push_back(*it);
+                        it = list.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            };
+            drainList(g_readyRetiredResources);
+            drainList(g_stagingRetiredResources);
+        }
+        for (const auto &item : pendingToFlush) {
+            if (item.registeredOnDevice && item.device == this) {
+                removeResource(item.resource, item.addressable);
+            }
+            if (item.resource != nullptr) {
+                item.resource->release();
+            }
+        }
 
         if (residencySet != nullptr) {
             residencySet->endResidency();
@@ -4677,11 +4831,15 @@ namespace plume {
     }
 
     void MetalDevice::addResource(MTL::Resource *resource, bool addressable) {
+        if (resource == nullptr) {
+            return;
+        }
         if (residencySet != nullptr || addressable) {
             std::lock_guard lock(resourcesMutex);
             if (residencySet != nullptr) {
                 residencySet->addAllocation(resource);
                 residencySet->commit();
+                g_residencySetDirty.store(true, std::memory_order_release);
             }
             if (addressable) {
                 gpuAddressableResources.push_back(resource);
@@ -4690,11 +4848,15 @@ namespace plume {
     }
 
     void MetalDevice::removeResource(MTL::Resource *resource, bool addressable) {
+        if (resource == nullptr) {
+            return;
+        }
         if (residencySet != nullptr || addressable) {
             std::lock_guard lock(resourcesMutex);
             if (residencySet != nullptr) {
                 residencySet->removeAllocation(resource);
                 residencySet->commit();
+                g_residencySetDirty.store(true, std::memory_order_release);
             }
             if (addressable) {
                 const auto it = std::find(gpuAddressableResources.begin(), gpuAddressableResources.end(), resource);
