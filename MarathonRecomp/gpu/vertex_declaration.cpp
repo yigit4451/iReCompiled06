@@ -213,8 +213,10 @@ GuestVertexDeclaration* CreateVertexDeclarationWithoutAddRef(GuestVertexElement*
                 case D3DDECLUSAGE_NORMAL:
                 case D3DDECLUSAGE_TANGENT:
                 case D3DDECLUSAGE_BINORMAL:
-                case D3DDECLUSAGE_BLENDINDICES:
                     format = RenderFormat::R32G32B32_FLOAT;
+                    break;
+                case D3DDECLUSAGE_BLENDINDICES:
+                    format = RenderFormat::R8G8B8A8_UINT;
                     break;
                 }
 

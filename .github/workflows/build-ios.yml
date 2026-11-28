@@ -191,6 +191,15 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}/thirdparty/vcpkg
         run: |
+          # Compile XenosRecomp Metal AIR shader libraries against the iphoneos SDK for iOS devices.
+          python3 - <<'PY'
+          from pathlib import Path
+          air_cpp = Path("tools/XenosRecomp/XenosRecomp/air_compiler.cpp")
+          if air_cpp.exists():
+              src = air_cpp.read_text()
+              updated = src.replace('"-sdk", "macosx"', '"-sdk", "iphoneos"')
+              air_cpp.write_text(updated)
+          PY
           cmake . --preset ios-host-tools
           cmake --build ./out/build/ios-host-tools --config Release --target file_to_c XenonRecomp u8extract XenosRecomp
 

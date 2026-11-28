@@ -660,8 +660,8 @@ namespace
     const UIEdgeInsets safe = self.safeAreaInsets;
     const CGFloat leftPad = MAX(safe.left, 16.0) + 10.0;
     const CGFloat rightPad = MAX(safe.right, 16.0) + 12.0;
-    const CGFloat topPad = MAX(safe.top, 10.0) + 8.0;
-    const CGFloat bottomPad = MAX(safe.bottom, 10.0) + 10.0;
+    const CGFloat topPad = MAX(safe.top, 6.0) + 4.0;
+    const CGFloat bottomPad = MAX(safe.bottom, 10.0) + 8.0;
 
     // 1. Hide/Show toggle button (bottom-left corner ">>")
     const CGFloat toggleW = 36.0;
@@ -671,11 +671,11 @@ namespace
     _toggleButtonLabel.frame = _toggleButtonView.bounds;
 
     // 2. Bottom-left Left Analog Stick
-    _leftStickRadius = 52.0;
+    _leftStickRadius = 48.0;
     const CGFloat stickDiameter = _leftStickRadius * 2.0;
     const CGFloat knobDiameter = 46.0;
-    const CGFloat stickCenterX = leftPad + _leftStickRadius + 24.0;
-    const CGFloat stickCenterY = bounds.size.height - bottomPad - _leftStickRadius - 18.0;
+    const CGFloat stickCenterX = leftPad + _leftStickRadius + 20.0;
+    const CGFloat stickCenterY = bounds.size.height - bottomPad - _leftStickRadius - 10.0;
     _leftStickRestCenter = CGPointMake(stickCenterX, stickCenterY);
 
     _leftStickBase.frame = CGRectMake(stickCenterX - _leftStickRadius, stickCenterY - _leftStickRadius, stickDiameter, stickDiameter);
@@ -687,11 +687,13 @@ namespace
     }
     _leftStickKnob.layer.cornerRadius = knobDiameter * 0.5;
 
-    // 3. Compact D-Pad above Left Analog Stick
-    const CGFloat dpadSize = 34.0;
-    const CGFloat dpadStep = 34.0;
-    const CGFloat dpadCenterX = leftPad + dpadStep + dpadSize * 0.5 + 8.0;
-    const CGFloat dpadCenterY = stickCenterY - _leftStickRadius - dpadStep - dpadSize * 0.5 - 14.0;
+    // 3. Compact D-Pad shifted right & down so its top button never overlaps the middle-left Sonic lives HUD
+    const CGFloat dpadSize = 30.0;
+    const CGFloat dpadStep = 29.0;
+    const CGFloat dpadHalfSpan = dpadStep + dpadSize * 0.5;
+    const CGFloat dpadCenterX = leftPad + dpadHalfSpan + 48.0;
+    const CGFloat dpadCenterY = MAX(bounds.size.height * 0.415 + dpadHalfSpan,
+                                    stickCenterY - _leftStickRadius - dpadHalfSpan - 8.0);
 
     const CGPoint dpadCenters[4] =
     {
@@ -704,15 +706,18 @@ namespace
     for (int i = 0; i < 4; ++i)
     {
         _buttonViews[i].frame = CGRectMake(dpadCenters[i].x - dpadSize * 0.5, dpadCenters[i].y - dpadSize * 0.5, dpadSize, dpadSize);
-        _buttonViews[i].layer.cornerRadius = 9.0;
+        _buttonViews[i].layer.cornerRadius = 8.0;
         _buttonLabels[i].frame = _buttonViews[i].bounds;
     }
 
-    // 4. Bottom-right Xbox 360 ABXY diamond: A (bottom), B (right), X (left), Y (top)
-    const CGFloat abxySize = 50.0;
-    const CGFloat diamondRadius = 48.0;
-    const CGFloat diamondCenterX = bounds.size.width - rightPad - diamondRadius - abxySize * 0.5 - 8.0;
-    const CGFloat diamondCenterY = bounds.size.height - bottomPad - diamondRadius - abxySize * 0.5 - 16.0;
+    // 4. Right-side Xbox 360 ABXY diamond shifted upward between the top-right Minimap and bottom-right Action Gauge
+    const CGFloat abxySize = 46.0;
+    const CGFloat diamondRadius = 43.0;
+    const CGFloat diamondHalfSpan = diamondRadius + abxySize * 0.5;
+    const CGFloat diamondCenterX = bounds.size.width - rightPad - diamondHalfSpan - 8.0;
+    const CGFloat gaugeSafeBottomY = MIN(bounds.size.height - bottomPad - 56.0, bounds.size.height * 0.780);
+    const CGFloat diamondCenterY = MAX(bounds.size.height * 0.445 + diamondHalfSpan,
+                                       gaugeSafeBottomY - diamondHalfSpan);
 
     const CGPoint abxyCenters[4] =
     {
@@ -731,17 +736,17 @@ namespace
     }
 
     // 5. Top-left LT / LB and Top-right RT / RB shoulder & trigger buttons
-    const CGFloat shoulderW = 64.0;
-    const CGFloat shoulderH = 34.0;
+    const CGFloat shoulderW = 62.0;
+    const CGFloat shoulderH = 30.0;
     const CGFloat shoulderGap = 10.0;
 
-    // Left: LT outermost top, LB right next to it (or stacked cleanly)
+    // Left: LT outermost top, LB right next to it
     _buttonViews[kBtnLT].frame = CGRectMake(leftPad, topPad, shoulderW, shoulderH);
-    _buttonViews[kBtnLT].layer.cornerRadius = 10.0;
+    _buttonViews[kBtnLT].layer.cornerRadius = 9.0;
     _buttonLabels[kBtnLT].frame = _buttonViews[kBtnLT].bounds;
 
     _buttonViews[kBtnLB].frame = CGRectMake(leftPad + shoulderW + shoulderGap, topPad, shoulderW, shoulderH);
-    _buttonViews[kBtnLB].layer.cornerRadius = 10.0;
+    _buttonViews[kBtnLB].layer.cornerRadius = 9.0;
     _buttonLabels[kBtnLB].frame = _buttonViews[kBtnLB].bounds;
 
     // Right: RB + RT mirrored at top-right
@@ -749,24 +754,24 @@ namespace
     const CGFloat rbX = rtX - shoulderGap - shoulderW;
 
     _buttonViews[kBtnRB].frame = CGRectMake(rbX, topPad, shoulderW, shoulderH);
-    _buttonViews[kBtnRB].layer.cornerRadius = 10.0;
+    _buttonViews[kBtnRB].layer.cornerRadius = 9.0;
     _buttonLabels[kBtnRB].frame = _buttonViews[kBtnRB].bounds;
 
     _buttonViews[kBtnRT].frame = CGRectMake(rtX, topPad, shoulderW, shoulderH);
-    _buttonViews[kBtnRT].layer.cornerRadius = 10.0;
+    _buttonViews[kBtnRT].layer.cornerRadius = 9.0;
     _buttonLabels[kBtnRT].frame = _buttonViews[kBtnRT].bounds;
 
     // 6. Top-center compact BACK and START buttons
     const CGFloat metaW = 58.0;
-    const CGFloat metaH = 28.0;
+    const CGFloat metaH = 26.0;
     const CGFloat metaGap = 16.0;
     const CGFloat midX = bounds.size.width * 0.5;
 
-    _buttonViews[kBtnBack].frame = CGRectMake(midX - metaGap * 0.5 - metaW, topPad + 3.0, metaW, metaH);
+    _buttonViews[kBtnBack].frame = CGRectMake(midX - metaGap * 0.5 - metaW, topPad + 2.0, metaW, metaH);
     _buttonViews[kBtnBack].layer.cornerRadius = metaH * 0.5;
     _buttonLabels[kBtnBack].frame = _buttonViews[kBtnBack].bounds;
 
-    _buttonViews[kBtnStart].frame = CGRectMake(midX + metaGap * 0.5, topPad + 3.0, metaW, metaH);
+    _buttonViews[kBtnStart].frame = CGRectMake(midX + metaGap * 0.5, topPad + 2.0, metaW, metaH);
     _buttonViews[kBtnStart].layer.cornerRadius = metaH * 0.5;
     _buttonLabels[kBtnStart].frame = _buttonViews[kBtnStart].bounds;
 }
