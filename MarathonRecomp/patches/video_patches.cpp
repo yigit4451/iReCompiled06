@@ -403,6 +403,7 @@ static constexpr uint32_t XMV_EOF_RESULT = 0x16660026; // XMEDIA_W_EOF = (5734 <
 static constexpr uint32_t XMV_STATE_FINISHED = 7;
 static std::atomic<uint32_t> g_xmvAbortedPlayer{ 0 };
 static std::atomic<uint32_t> g_activeXmvPlayer{ 0 };
+static std::atomic<uint64_t> g_xmvAbortDrainUntilMs{ 0 };
 
 // Track CCalXmvPlayer* passed into CCalXmvPlayer::GetStatus (sub_82733640) so we can mute/quiesce its XAudioSourceVoice
 // before MovieObjectWmv::Update destroys the player on EOF.
@@ -433,6 +434,8 @@ static void XmvQuiesceCalAudioVoice(uint8_t* base, uint32_t calPlayerAddr)
 
 static void XmvFinishPlayer(uint8_t* base, uint32_t player)
 {
+    g_xmvAbortDrainUntilMs.store(XmvNowMs() + 3000u, std::memory_order_release);
+
     if (base == nullptr || player < 0x10000u)
         return;
 
@@ -479,6 +482,8 @@ static void XmvFinishPlayer(uint8_t* base, uint32_t player)
 
 void XmvForceAbortActivePlayer()
 {
+    g_xmvAbortDrainUntilMs.store(XmvNowMs() + 3000u, std::memory_order_release);
+
     if (g_memory.base == nullptr)
         return;
 
@@ -500,8 +505,13 @@ PPC_FUNC_IMPL(__imp__sub_82743680);
 PPC_FUNC(sub_82743680)
 {
     const uint32_t player = ctx.r3.u32;
+    const uint32_t prevActive = g_activeXmvPlayer.load(std::memory_order_acquire);
     if (player >= 0x10000u)
+    {
+        if (prevActive != 0 && prevActive != player)
+            g_xmvAbortDrainUntilMs.store(0, std::memory_order_release);
         g_activeXmvPlayer.store(player, std::memory_order_release);
+    }
 
     const uint32_t prevAborted = g_xmvAbortedPlayer.load(std::memory_order_acquire);
 
@@ -510,6 +520,7 @@ PPC_FUNC(sub_82743680)
     {
         g_xmvAbortedPlayer.store(0, std::memory_order_release);
         g_xmvAbortRequested.store(false, std::memory_order_release);
+        g_xmvAbortDrainUntilMs.store(0, std::memory_order_release);
     }
 
     if (g_xmvAbortedPlayer.load(std::memory_order_acquire) == player && player != 0)
@@ -548,6 +559,7 @@ PPC_FUNC(sub_82733640)
 
     if (g_xmvAbortedPlayer.load(std::memory_order_acquire) != 0 && pStatus >= 0x10000u)
     {
+        g_xmvAbortDrainUntilMs.store(XmvNowMs() + 3000u, std::memory_order_release);
         XmvQuiesceCalAudioVoice(base, calPlayer);
         *reinterpret_cast<be<uint32_t>*>(base + pStatus) = XMV_STATE_FINISHED;
         // Clear g_xmvAbortedPlayer after reporting FINISHED so MovieObjectWmv::Update tears down this movie
@@ -559,4 +571,28 @@ PPC_FUNC(sub_82733640)
     }
 
     __imp__sub_82733640(ctx, base);
+}
+
+// Guard XMV worker helper sub_827441B8 (called on XMV decoder thread 0x82742358 via
+// sub_827442E8 -> sub_82742B90 -> sub_827428B0 -> sub_827441B8) against NULL r3 (0x00000004 / 0x7000000004 SIGBUS)
+// and post-abort teardown races while worker threads finish their final iteration and exit.
+PPC_FUNC_IMPL(__imp__sub_827441B8);
+PPC_FUNC(sub_827441B8)
+{
+    const uint32_t ptr = ctx.r3.u32;
+    if (base == nullptr || ptr < 0x10000u || ptr >= 0xF0000000u)
+    {
+        ctx.r3.u32 = 0;
+        return;
+    }
+
+    if (g_xmvAbortRequested.load(std::memory_order_acquire) ||
+        g_xmvAbortedPlayer.load(std::memory_order_acquire) != 0 ||
+        XmvNowMs() < g_xmvAbortDrainUntilMs.load(std::memory_order_acquire))
+    {
+        ctx.r3.u32 = 0;
+        return;
+    }
+
+    __imp__sub_827441B8(ctx, base);
 }
