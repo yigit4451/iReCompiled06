@@ -260,10 +260,10 @@ namespace
             budget.tier = os::ios::DeviceMemoryTier::Low4GB;
             budget.guestUserHeapBytes = 512ULL * MiB;
             budget.guestPhysicalHeapBytes = 512ULL * MiB;
-            budget.texturePoolMaxBytes = 256ULL * MiB;
+            budget.texturePoolMaxBytes = 448ULL * MiB;
             budget.uploadChunkBytes = 4ULL * MiB;
             budget.maxRetainedUploadChunks = 1;
-            budget.maxInternalRenderHeight = 720;
+            budget.maxInternalRenderHeight = 600;
             budget.pipelineCompilerThreads = 1;
             budget.jetsamLowWaterBytes = 256ULL * MiB;
         }

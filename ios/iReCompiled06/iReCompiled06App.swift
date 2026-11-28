@@ -65,7 +65,7 @@ final class MarathonLaunchController {
         startEventPump()
 
         let arguments = CommandLine.arguments
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             let exitCode = Self.invokeMarathonMain(arguments: arguments)
             let detail = exitCode != 0 ? String(cString: MarathonGetLastErrorMessage()) : ""
 

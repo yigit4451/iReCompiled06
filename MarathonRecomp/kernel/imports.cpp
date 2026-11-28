@@ -1,5 +1,7 @@
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 #include <stdafx.h>
 #include <cpu/ppc_context.h>
 #include <cpu/guest_thread.h>
@@ -22,10 +24,28 @@
 
 std::unordered_map<uint32_t, uint32_t> g_handleDuplicates{};
 
+static std::atomic<uint32_t> g_keSetEventGeneration{ 0 };
+static std::mutex g_multiWaitMutex;
+static std::condition_variable g_multiWaitCv;
+static std::atomic<uint32_t> g_multiWaiterCount{ 0 };
+
+static inline void NotifyMultiWaiters()
+{
+    g_keSetEventGeneration.fetch_add(1, std::memory_order_seq_cst);
+    if (g_multiWaiterCount.load(std::memory_order_seq_cst) > 0)
+    {
+        std::lock_guard<std::mutex> lock(g_multiWaitMutex);
+        g_multiWaitCv.notify_all();
+    }
+}
+
 struct Event final : KernelObject, HostObject<XKEVENT>
 {
     bool manualReset;
     std::atomic<bool> signaled;
+    std::mutex waitMutex;
+    std::condition_variable waitCv;
+    std::atomic<uint32_t> waiterCount{ 0 };
 
     Event(XKEVENT* header)
         : manualReset(!header->Type), signaled(!!header->SignalState)
@@ -37,84 +57,84 @@ struct Event final : KernelObject, HostObject<XKEVENT>
     {
     }
 
+    inline bool TryAcquire()
+    {
+        if (manualReset)
+            return signaled.load(std::memory_order_acquire);
+
+        bool expected = true;
+        return signaled.compare_exchange_strong(expected, false, std::memory_order_acq_rel);
+    }
+
     uint32_t Wait(uint32_t timeout) override
     {
+        if (TryAcquire())
+            return STATUS_SUCCESS;
+
         if (timeout == 0)
+            return STATUS_TIMEOUT;
+
+        for (uint32_t spin = 0; spin < 16; ++spin)
         {
-            if (manualReset)
+            std::this_thread::yield();
+            if (TryAcquire())
+                return STATUS_SUCCESS;
+        }
+
+        const auto deadline = (timeout == INFINITE)
+            ? std::chrono::steady_clock::time_point::max()
+            : (std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout));
+
+        while (true)
+        {
+            if (TryAcquire())
+                return STATUS_SUCCESS;
+
+            if (timeout != INFINITE && std::chrono::steady_clock::now() >= deadline)
+                return STATUS_TIMEOUT;
+
+            std::unique_lock<std::mutex> lock(waitMutex);
+            waiterCount.fetch_add(1, std::memory_order_seq_cst);
+            if (!TryAcquire())
             {
-                if (!signaled.load(std::memory_order_acquire))
-                    return STATUS_TIMEOUT;
+                auto waitDur = std::chrono::milliseconds(15);
+                if (timeout != INFINITE)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline)
+                    {
+                        waiterCount.fetch_sub(1, std::memory_order_relaxed);
+                        return STATUS_TIMEOUT;
+                    }
+                    const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+                    if (rem < waitDur)
+                        waitDur = std::max(rem, std::chrono::milliseconds(1));
+                }
+                waitCv.wait_for(lock, waitDur);
             }
             else
             {
-                bool expected = true;
-                if (!signaled.compare_exchange_strong(expected, false, std::memory_order_acq_rel))
-                    return STATUS_TIMEOUT;
+                waiterCount.fetch_sub(1, std::memory_order_relaxed);
+                return STATUS_SUCCESS;
             }
+            waiterCount.fetch_sub(1, std::memory_order_relaxed);
         }
-        else if (timeout == INFINITE)
-        {
-            // Avoid unbounded std::atomic::wait on Darwin/iOS ulock where rapid Set()/Wait() transitions
-            // across 20+ GuestWorker threads (FrameSynchronizerThread / FrustumCullingThread / XAudio)
-            // can miss an edge wakeup and leave GuestMain (sub_82586AC0 -> NtWaitForSingleObjectEx) stuck forever.
-            uint32_t spins = 0;
-            while (true)
-            {
-                if (manualReset)
-                {
-                    if (signaled.load(std::memory_order_acquire))
-                        return STATUS_SUCCESS;
-                }
-                else
-                {
-                    bool expected = true;
-                    if (signaled.compare_exchange_strong(expected, false, std::memory_order_acq_rel))
-                        return STATUS_SUCCESS;
-                }
-
-                if (++spins < 64)
-                    std::this_thread::yield();
-                else
-                    std::this_thread::sleep_for(std::chrono::microseconds(250));
-            }
-        }
-        else
-        {
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
-            while (true)
-            {
-                if (manualReset)
-                {
-                    if (signaled.load(std::memory_order_acquire))
-                        return STATUS_SUCCESS;
-                }
-                else
-                {
-                    bool expected = true;
-                    if (signaled.compare_exchange_strong(expected, false, std::memory_order_acq_rel))
-                        return STATUS_SUCCESS;
-                }
-
-                if (std::chrono::steady_clock::now() >= deadline)
-                    return STATUS_TIMEOUT;
-
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
-            }
-        }
-
-        return STATUS_SUCCESS;
     }
 
     bool Set()
     {
-        signaled.store(true, std::memory_order_release);
+        signaled.store(true, std::memory_order_seq_cst);
 
-        if (manualReset)
-            signaled.notify_all();
-        else
-            signaled.notify_one();
+        if (waiterCount.load(std::memory_order_seq_cst) > 0)
+        {
+            std::lock_guard<std::mutex> lock(waitMutex);
+            if (manualReset)
+                waitCv.notify_all();
+            else
+                waitCv.notify_one();
+        }
 
+        NotifyMultiWaiters();
         return TRUE;
     }
 
@@ -125,12 +145,13 @@ struct Event final : KernelObject, HostObject<XKEVENT>
     }
 };
 
-static std::atomic<uint32_t> g_keSetEventGeneration;
-
 struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
 {
     std::atomic<uint32_t> count;
     uint32_t maximumCount;
+    std::mutex waitMutex;
+    std::condition_variable waitCv;
+    std::atomic<uint32_t> waiterCount{ 0 };
 
     Semaphore(XKSEMAPHORE* semaphore)
         : count(semaphore->Header.SignalState), maximumCount(semaphore->Limit)
@@ -142,48 +163,69 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
     {
     }
 
+    inline bool TryAcquire()
+    {
+        uint32_t currentCount = count.load(std::memory_order_acquire);
+        while (currentCount != 0)
+        {
+            if (count.compare_exchange_weak(currentCount, currentCount - 1, std::memory_order_acq_rel))
+                return true;
+        }
+        return false;
+    }
+
     uint32_t Wait(uint32_t timeout) override
     {
+        if (TryAcquire())
+            return STATUS_SUCCESS;
+
         if (timeout == 0)
-        {
-            uint32_t currentCount = count.load(std::memory_order_acquire);
-            if (currentCount != 0)
-            {
-                if (count.compare_exchange_weak(currentCount, currentCount - 1, std::memory_order_acq_rel))
-                    return STATUS_SUCCESS;
-            }
-
             return STATUS_TIMEOUT;
-        }
-        else if (timeout == INFINITE)
+
+        for (uint32_t spin = 0; spin < 16; ++spin)
         {
-            uint32_t spins = 0;
-            while (true)
-            {
-                uint32_t currentCount = count.load(std::memory_order_acquire);
-                if (currentCount != 0 && count.compare_exchange_weak(currentCount, currentCount - 1, std::memory_order_acq_rel))
-                    return STATUS_SUCCESS;
-
-                if (++spins < 64)
-                    std::this_thread::yield();
-                else
-                    std::this_thread::sleep_for(std::chrono::microseconds(250));
-            }
+            std::this_thread::yield();
+            if (TryAcquire())
+                return STATUS_SUCCESS;
         }
-        else
+
+        const auto deadline = (timeout == INFINITE)
+            ? std::chrono::steady_clock::time_point::max()
+            : (std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout));
+
+        while (true)
         {
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
-            while (true)
+            if (TryAcquire())
+                return STATUS_SUCCESS;
+
+            if (timeout != INFINITE && std::chrono::steady_clock::now() >= deadline)
+                return STATUS_TIMEOUT;
+
+            std::unique_lock<std::mutex> lock(waitMutex);
+            waiterCount.fetch_add(1, std::memory_order_seq_cst);
+            if (!TryAcquire())
             {
-                uint32_t currentCount = count.load(std::memory_order_acquire);
-                if (currentCount != 0 && count.compare_exchange_weak(currentCount, currentCount - 1, std::memory_order_acq_rel))
-                    return STATUS_SUCCESS;
-
-                if (std::chrono::steady_clock::now() >= deadline)
-                    return STATUS_TIMEOUT;
-
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
+                auto waitDur = std::chrono::milliseconds(15);
+                if (timeout != INFINITE)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline)
+                    {
+                        waiterCount.fetch_sub(1, std::memory_order_relaxed);
+                        return STATUS_TIMEOUT;
+                    }
+                    const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+                    if (rem < waitDur)
+                        waitDur = std::max(rem, std::chrono::milliseconds(1));
+                }
+                waitCv.wait_for(lock, waitDur);
             }
+            else
+            {
+                waiterCount.fetch_sub(1, std::memory_order_relaxed);
+                return STATUS_SUCCESS;
+            }
+            waiterCount.fetch_sub(1, std::memory_order_relaxed);
         }
     }
 
@@ -194,8 +236,16 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
 
         assert(count + releaseCount <= maximumCount);
 
-        count.fetch_add(releaseCount, std::memory_order_acq_rel);
-        count.notify_all();
+        count.fetch_add(releaseCount, std::memory_order_seq_cst);
+        if (waiterCount.load(std::memory_order_seq_cst) > 0)
+        {
+            std::lock_guard<std::mutex> lock(waitMutex);
+            if (releaseCount > 1)
+                waitCv.notify_all();
+            else
+                waitCv.notify_one();
+        }
+        NotifyMultiWaiters();
     }
 };
 
@@ -1211,12 +1261,7 @@ void KeUnlockL2()
 
 bool KeSetEvent(XKEVENT* pEvent, uint32_t Increment, bool Wait)
 {
-    bool result = QueryKernelObject<Event>(*pEvent)->Set();
-
-    ++g_keSetEventGeneration;
-    g_keSetEventGeneration.notify_all();
-
-    return result;
+    return QueryKernelObject<Event>(*pEvent)->Set();
 }
 
 bool KeResetEvent(XKEVENT* pEvent)
@@ -1667,8 +1712,6 @@ uint32_t NtResumeThread(GuestThreadHandle* hThread, be<uint32_t>* suspendCount)
 uint32_t NtSetEvent(Event* handle, uint32_t* previousState)
 {
     handle->Set();
-    ++g_keSetEventGeneration;
-    g_keSetEventGeneration.notify_all();
     return 0;
 }
 
@@ -1725,6 +1768,8 @@ uint32_t NtWaitForMultipleObjectsEx(uint32_t Count, be<uint32_t>* Handles, uint3
 
     while (true)
     {
+        const uint32_t generation = g_keSetEventGeneration.load(std::memory_order_seq_cst);
+
         for (uint32_t i = 0; i < Count; ++i)
         {
             const uint32_t h = Handles[i].get();
@@ -1735,7 +1780,26 @@ uint32_t NtWaitForMultipleObjectsEx(uint32_t Count, be<uint32_t>* Handles, uint3
         if (timeout == 0 || (timeout != INFINITE && std::chrono::steady_clock::now() >= deadline))
             return STATUS_TIMEOUT;
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::unique_lock<std::mutex> lock(g_multiWaitMutex);
+        g_multiWaiterCount.fetch_add(1, std::memory_order_seq_cst);
+        if (g_keSetEventGeneration.load(std::memory_order_seq_cst) == generation)
+        {
+            auto waitDur = std::chrono::milliseconds(15);
+            if (timeout != INFINITE)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline)
+                {
+                    g_multiWaiterCount.fetch_sub(1, std::memory_order_relaxed);
+                    return STATUS_TIMEOUT;
+                }
+                const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+                if (rem < waitDur)
+                    waitDur = std::max(rem, std::chrono::milliseconds(1));
+            }
+            g_multiWaitCv.wait_for(lock, waitDur);
+        }
+        g_multiWaiterCount.fetch_sub(1, std::memory_order_relaxed);
     }
 }
 
@@ -2011,7 +2075,7 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
 
         while (true)
         {
-            const uint32_t generation = g_keSetEventGeneration.load(std::memory_order_acquire);
+            const uint32_t generation = g_keSetEventGeneration.load(std::memory_order_seq_cst);
 
             for (size_t i = 0; i < Count; i++)
             {
@@ -2022,10 +2086,26 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
             if (timeout != INFINITE && std::chrono::steady_clock::now() >= deadline)
                 return STATUS_TIMEOUT;
 
-            // Avoid unbounded std::atomic::wait on Darwin ulock where rapid KeSetEvent increments on XAudio /
-            // FrameSynchronizer worker events can miss a single wakeup edge; re-poll after 1 ms if unchanged.
-            if (g_keSetEventGeneration.load(std::memory_order_acquire) == generation)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::unique_lock<std::mutex> lock(g_multiWaitMutex);
+            g_multiWaiterCount.fetch_add(1, std::memory_order_seq_cst);
+            if (g_keSetEventGeneration.load(std::memory_order_seq_cst) == generation)
+            {
+                auto waitDur = std::chrono::milliseconds(15);
+                if (timeout != INFINITE)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline)
+                    {
+                        g_multiWaiterCount.fetch_sub(1, std::memory_order_relaxed);
+                        return STATUS_TIMEOUT;
+                    }
+                    const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+                    if (rem < waitDur)
+                        waitDur = std::max(rem, std::chrono::milliseconds(1));
+                }
+                g_multiWaitCv.wait_for(lock, waitDur);
+            }
+            g_multiWaiterCount.fetch_sub(1, std::memory_order_relaxed);
         }
     }
 

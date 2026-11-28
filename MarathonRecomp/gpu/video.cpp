@@ -1126,8 +1126,10 @@ static void BeginCommandList()
     auto& commandList = g_commandLists[g_frame];
 
     commandList->begin();
+#ifndef MARATHON_RECOMP_IOS
     commandList->resetQueryPool(g_queryPools[g_frame].get(), 0, NUM_QUERIES);
     commandList->writeTimestamp(g_queryPools[g_frame].get(), 0);
+#endif
     commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
@@ -1156,16 +1158,65 @@ static void ApplyLowEndDefaults()
     bool changed = false;
 
 #ifdef MARATHON_RECOMP_IOS
-    const auto defaultAA = (os::ios::GetMemoryBudget().tier == os::ios::DeviceMemoryTier::Low4GB)
-        ? EAntiAliasing::Off
-        : EAntiAliasing::MSAA2x;
-    ApplyLowEndDefault(Config::AntiAliasing, defaultAA, changed);
+    const auto tier = os::ios::GetMemoryBudget().tier;
+    if (tier == os::ios::DeviceMemoryTier::Low4GB)
+    {
+        // A13 / 4 GB iPhones (iPhone 11 / 12 / 13 / SE): enforce mobile-friendly GPU budgets even if an
+        // earlier first-run config.toml persisted desktop defaults (MSAA4x, 4096 shadows, 16x aniso, Half reflections).
+        Config::AntiAliasing.DefaultValue = EAntiAliasing::Off;
+        if (Config::AntiAliasing.Value != EAntiAliasing::Off)
+        {
+            Config::AntiAliasing = EAntiAliasing::Off;
+            changed = true;
+        }
+
+        Config::TransparencyAntiAliasing.DefaultValue = false;
+        if (Config::TransparencyAntiAliasing.Value)
+        {
+            Config::TransparencyAntiAliasing = false;
+            changed = true;
+        }
+
+        Config::ShadowResolution.DefaultValue = EShadowResolution::x512;
+        if (Config::ShadowResolution.Value > EShadowResolution::x512)
+        {
+            Config::ShadowResolution = EShadowResolution::x512;
+            changed = true;
+        }
+
+        Config::ReflectionResolution.DefaultValue = EReflectionResolution::Eighth;
+        if (Config::ReflectionResolution.Value > EReflectionResolution::Eighth)
+        {
+            Config::ReflectionResolution = EReflectionResolution::Eighth;
+            changed = true;
+        }
+
+        Config::AnisotropicFiltering.DefaultValue = 2u;
+        if (Config::AnisotropicFiltering.Value > 2u)
+        {
+            Config::AnisotropicFiltering = 2u;
+            changed = true;
+        }
+    }
+    else
+    {
+        ApplyLowEndDefault(Config::AntiAliasing, EAntiAliasing::Off, changed);
+        ApplyLowEndDefault(Config::ShadowResolution, EShadowResolution::x1024, changed);
+        ApplyLowEndDefault(Config::ReflectionResolution, EReflectionResolution::Quarter, changed);
+        ApplyLowEndDefault(Config::TransparencyAntiAliasing, false, changed);
+        Config::AnisotropicFiltering.DefaultValue = 4u;
+        if (Config::AnisotropicFiltering.Value > 4u)
+        {
+            Config::AnisotropicFiltering = 4u;
+            changed = true;
+        }
+    }
 #else
     ApplyLowEndDefault(Config::AntiAliasing, EAntiAliasing::MSAA2x, changed);
-#endif
     ApplyLowEndDefault(Config::ShadowResolution, EShadowResolution::x1024, changed);
     ApplyLowEndDefault(Config::ReflectionResolution, EReflectionResolution::Quarter, changed);
     ApplyLowEndDefault(Config::TransparencyAntiAliasing, false, changed);
+#endif
 
     if (changed)
     {
@@ -2639,10 +2690,12 @@ void Video::Present()
         g_frameFenceProfiler.End();
         g_commandListStates[g_frame] = false;
 
+#ifndef MARATHON_RECOMP_IOS
         // Update the GPU profiler with the results from the timestamps of the frame.
         g_queryPools[g_frame]->queryResults();
         const uint64_t *frameTimestamps = g_queryPools[g_frame]->getResults();
         g_gpuFrameProfiler.Set(static_cast<double>(frameTimestamps[1] - frameTimestamps[0]) / 1000000.0);
+#endif
     }
 
     Watchdog::NotifyFramePresented(callerLr);
@@ -2654,10 +2707,14 @@ void Video::Present()
     g_quadIndexData.reset();
 
 #ifdef MARATHON_RECOMP_IOS
-    const auto& iosBudget = os::ios::GetMemoryBudget();
-    const bool overTexturePoolCap = g_liveTextureBytes.load(std::memory_order_relaxed) > iosBudget.texturePoolMaxBytes;
-    if (os::ios::ConsumeMemoryWarningFlag() || os::ios::IsJetsamPressureHigh() || overTexturePoolCap)
+    // IMPORTANT: Never trigger render-target cache clears from g_liveTextureBytes! g_liveTextureBytes tracks stage DDS
+    // textures (not render targets), so clearing g_renderTargetCache every frame once Soleanna exceeds 256 MiB caused
+    // a 60 Hz WaitForGPU() + full framebuffer/shadow/HDR reallocation storm even with >1.5 GiB free Jetsam RAM.
+    static double s_lastIosEmergencyPurgeTime = -100.0;
+    const bool memoryWarning = os::ios::ConsumeMemoryWarningFlag();
+    if ((memoryWarning || os::ios::IsJetsamPressureHigh()) && (App::s_time - s_lastIosEmergencyPurgeTime >= 5.0))
     {
+        s_lastIosEmergencyPurgeTime = App::s_time;
         Video::WaitForGPU();
         g_renderTargetCache.clear();
         g_renderProcessCache.clear();
@@ -3149,7 +3206,9 @@ static void ProcRenderCommand(const RenderCommands::ExecuteCommandList& cmd)
     }
 
     auto &commandList = g_commandLists[g_frame];
+#ifndef MARATHON_RECOMP_IOS
     commandList->writeTimestamp(g_queryPools[g_frame].get(), 1);
+#endif
     commandList->end();
 
     if (g_swapChainValid)
@@ -4266,12 +4325,19 @@ static void ProcRenderCommand(const RenderCommands::SetClipPlane& args)
     SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.clipPlane[3], args.plane[3]);
 }
 
+#ifdef MARATHON_RECOMP_IOS
+#include <pthread/qos.h>
+#endif
+
 static HostThread g_renderThread("Render Thread", []
     {
         HostThread::SetCurrentThreadPriority(HostThreadPriority::High);
+#ifdef MARATHON_RECOMP_IOS
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
         Watchdog::RegisterCurrentThread(Watchdog::ThreadKind::Render, "Render Thread", 0);
 
-        RenderCommand commands[32];
+        RenderCommand commands[256];
 
         while (true)
         {

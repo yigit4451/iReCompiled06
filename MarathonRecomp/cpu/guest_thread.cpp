@@ -14,6 +14,9 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#ifdef MARATHON_RECOMP_IOS
+#include <pthread/qos.h>
+#endif
 
 constexpr size_t PCR_SIZE = 0xAB0;
 constexpr size_t TLS_SIZE = 0x100;
@@ -185,6 +188,18 @@ static void GuestThreadFunc(void* data)
 {
     auto* hThread = static_cast<GuestThreadHandle*>(data);
     const std::string threadName = GetGuestThreadName(hThread->params);
+#ifdef MARATHON_RECOMP_IOS
+    if (threadName.find("Synchronizer") != std::string::npos ||
+        threadName.find("Frustum") != std::string::npos ||
+        hThread->params.function == 0x8255B848u)
+    {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    }
+    else
+    {
+        pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    }
+#endif
     Watchdog::RegisterCurrentThread(Watchdog::ThreadKind::GuestWorker, threadName.c_str(), hThread->params.function);
     {
         Watchdog::ScopedWait waitGuard("GuestThread::InitialSuspend", hThread->params.function, 0, INFINITE, 0x104u);
@@ -258,6 +273,12 @@ uint32_t GuestThreadHandle::Wait(uint32_t timeout)
 
 uint32_t GuestThread::Start(const GuestThreadParams& params)
 {
+#ifdef MARATHON_RECOMP_IOS
+    if (params.value == 0 && params.flags == 0)
+    {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+#endif
     const auto procMask = (uint8_t)(params.flags >> 24);
     const auto cpuNumber = procMask == 0 ? 0 : 7 - std::countl_zero(procMask);
 

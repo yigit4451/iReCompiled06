@@ -161,6 +161,7 @@ namespace HID
 
         virtual bool OnProcessMessage(IMessage& io_rMessage) override
         {
+#ifndef MARATHON_RECOMP_IOS
             if (io_rMessage.Is<MsgPeripheralDetached>())
             {
                 SDL_SetWindowRelativeMouseMode(GameWindow::s_pWindow, false);
@@ -169,6 +170,7 @@ namespace HID
             {
                 SDL_SetWindowRelativeMouseMode(GameWindow::s_pWindow, static_cast<MsgSetMouseCapture*>(&io_rMessage)->Enabled);
             }
+#endif
 
             return Mouse::OnProcessMessage(io_rMessage);
         }

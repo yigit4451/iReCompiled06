@@ -197,7 +197,11 @@ PPC_FUNC(sub_825EA610)
 
     App::s_isPaused = pDoc->m_PauseFlags.get();
 
+#ifdef MARATHON_RECOMP_IOS
+    if (App::s_isPaused && Video::s_needsResize)
+#else
     if (App::s_isPaused)
+#endif
     {
         // Update visual tasks for resizing buffers on pause.
         pDoc->m_pRootTask->Walk([](Sonicteam::SoX::Engine::Task* in_pTask) -> bool
@@ -214,6 +218,7 @@ PPC_FUNC(sub_825EA610)
         });
     }
 
+#ifndef MARATHON_RECOMP_IOS
     const auto pHidManager = HID::GetManager();
 
     if (const auto pGameMode = pDoc->GetDocMode<Sonicteam::GameMode>("GameMode"))
@@ -234,6 +239,7 @@ PPC_FUNC(sub_825EA610)
     {
         pHidManager->BroadcastMessage<HID::MsgSetMouseCapture>(false);
     }
+#endif
 }
 
 // Sonicteam::SpanverseHeap::Alloc

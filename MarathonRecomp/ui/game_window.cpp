@@ -167,7 +167,9 @@ bool Window_OnSDLEvent(void*, SDL_Event* event)
 
         case SDL_EVENT_MOUSE_MOTION:
             g_lastCursorMotionTime = App::s_time;
+#ifndef MARATHON_RECOMP_IOS
             SDL_ShowCursor();
+#endif
             break;
 
         case SDL_EVENT_GAMEPAD_AXIS_MOTION:
@@ -175,6 +177,7 @@ bool Window_OnSDLEvent(void*, SDL_Event* event)
         case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
         case SDL_EVENT_GAMEPAD_BUTTON_UP:
         {
+#ifndef MARATHON_RECOMP_IOS
             if (event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION)
             {
                 if (abs(event->gaxis.value) > 8000)
@@ -184,13 +187,16 @@ bool Window_OnSDLEvent(void*, SDL_Event* event)
             {
                 SDL_HideCursor();
             }
+#endif
 
             break;
         }
 
         case SDL_EVENT_WINDOW_FOCUS_LOST:
             GameWindow::s_isFocused = false;
+#ifndef MARATHON_RECOMP_IOS
             SDL_ShowCursor();
+#endif
             break;
 
         case SDL_EVENT_WINDOW_FOCUS_GAINED:
@@ -340,9 +346,11 @@ void GameWindow::Init(const char* sdlVideoDriver)
 
 void GameWindow::Update()
 {
+#ifndef MARATHON_RECOMP_IOS
     // Disable resizing on loading screens, as buffer
     // resize is inoperable on the loading thread.
     SDL_SetWindowResizable(s_pWindow, !App::s_isLoading);
+#endif
 
     // Execute window commands after loading is complete.
     if (!App::s_isLoading && !g_commandQueue.Empty())
@@ -351,6 +359,7 @@ void GameWindow::Update()
         g_commandQueue.Pop();
     }
 
+#ifndef MARATHON_RECOMP_IOS
     if (SDL_GetWindowRelativeMouseMode(s_pWindow))
     {
         SDL_HideCursor();
@@ -360,6 +369,7 @@ void GameWindow::Update()
         if (App::s_time - g_lastCursorMotionTime >= 2.0)
             SDL_HideCursor();
     }
+#endif
 
     if (!GameWindow::IsFullscreen() && !GameWindow::IsMaximised() && !s_isChangingDisplay)
     {
@@ -452,6 +462,10 @@ const char* GameWindow::GetTitle()
 
 void GameWindow::SetTitle(const char* title)
 {
+#if defined(__APPLE__) && TARGET_OS_IOS
+    if (!os::ios::IsMainThread())
+        return;
+#endif
     SDL_SetWindowTitle(s_pWindow, title ? title : GetTitle());
 }
 

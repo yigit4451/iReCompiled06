@@ -5,6 +5,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#include <atomic>
 #include <cmath>
 
 namespace plume
@@ -62,40 +63,82 @@ namespace plume
 
     CocoaWindow::~CocoaWindow() = default;
 
+    namespace
+    {
+        std::atomic<bool> g_windowAttrUpdateQueued{ false };
+        std::atomic<uint32_t> g_windowAttrQueryTick{ 0 };
+        std::atomic<bool> g_refreshRateUpdateQueued{ false };
+        std::atomic<uint32_t> g_refreshRateQueryTick{ 0 };
+    }
+
     void CocoaWindow::updateWindowAttributesInternal(bool forceSync)
     {
-        auto updateBlock = ^{
+        if (forceSync)
+        {
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                UIWindow* uiWindow = (__bridge UIWindow*)windowHandle;
+                UIScreen* screen = getWindowScreen(uiWindow);
+                CGRect bounds = uiWindow ? uiWindow.bounds : screen.bounds;
+                CGFloat scaleFactor = getScaleFactor(uiWindow);
+
+                std::lock_guard<std::mutex> lock(attributesMutex);
+                cachedAttributes.x = static_cast<int>(std::round(bounds.origin.x));
+                cachedAttributes.y = static_cast<int>(std::round(bounds.origin.y));
+                cachedAttributes.width = static_cast<int>(std::round(bounds.size.width * scaleFactor));
+                cachedAttributes.height = static_cast<int>(std::round(bounds.size.height * scaleFactor));
+            });
+            return;
+        }
+
+        if ((g_windowAttrQueryTick.fetch_add(1, std::memory_order_relaxed) & 31u) != 0u)
+            return;
+
+        if (g_windowAttrUpdateQueued.exchange(true, std::memory_order_acq_rel))
+            return;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
             UIWindow* uiWindow = (__bridge UIWindow*)windowHandle;
             UIScreen* screen = getWindowScreen(uiWindow);
             CGRect bounds = uiWindow ? uiWindow.bounds : screen.bounds;
             CGFloat scaleFactor = getScaleFactor(uiWindow);
 
-            std::lock_guard<std::mutex> lock(attributesMutex);
-            cachedAttributes.x = static_cast<int>(std::round(bounds.origin.x));
-            cachedAttributes.y = static_cast<int>(std::round(bounds.origin.y));
-            cachedAttributes.width = static_cast<int>(std::round(bounds.size.width * scaleFactor));
-            cachedAttributes.height = static_cast<int>(std::round(bounds.size.height * scaleFactor));
-        };
-
-        if (forceSync)
-            dispatch_sync(dispatch_get_main_queue(), updateBlock);
-        else
-            dispatch_async(dispatch_get_main_queue(), updateBlock);
+            {
+                std::lock_guard<std::mutex> lock(attributesMutex);
+                cachedAttributes.x = static_cast<int>(std::round(bounds.origin.x));
+                cachedAttributes.y = static_cast<int>(std::round(bounds.origin.y));
+                cachedAttributes.width = static_cast<int>(std::round(bounds.size.width * scaleFactor));
+                cachedAttributes.height = static_cast<int>(std::round(bounds.size.height * scaleFactor));
+            }
+            g_windowAttrUpdateQueued.store(false, std::memory_order_release);
+        });
     }
 
     void CocoaWindow::updateRefreshRateInternal(bool forceSync)
     {
-        auto updateBlock = ^{
+        if (forceSync)
+        {
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                UIWindow* uiWindow = (__bridge UIWindow*)windowHandle;
+                UIScreen* screen = getWindowScreen(uiWindow);
+                if (screen)
+                    cachedRefreshRate.store(static_cast<int>(screen.maximumFramesPerSecond));
+            });
+            return;
+        }
+
+        if ((g_refreshRateQueryTick.fetch_add(1, std::memory_order_relaxed) & 63u) != 0u)
+            return;
+
+        if (g_refreshRateUpdateQueued.exchange(true, std::memory_order_acq_rel))
+            return;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
             UIWindow* uiWindow = (__bridge UIWindow*)windowHandle;
             UIScreen* screen = getWindowScreen(uiWindow);
             if (screen)
                 cachedRefreshRate.store(static_cast<int>(screen.maximumFramesPerSecond));
-        };
-
-        if (forceSync)
-            dispatch_sync(dispatch_get_main_queue(), updateBlock);
-        else
-            dispatch_async(dispatch_get_main_queue(), updateBlock);
+            g_refreshRateUpdateQueued.store(false, std::memory_order_release);
+        });
     }
 
     void CocoaWindow::getWindowAttributes(CocoaWindowAttributes* attributes) const

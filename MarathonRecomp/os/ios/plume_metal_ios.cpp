@@ -59,11 +59,22 @@ namespace plume {
             std::atomic<bool> fenceSignaled{ false };
         };
 
+        struct DescriptorSetDenseEntry {
+            const MTL::Resource *resource = nullptr;
+            RenderDescriptorRangeType type = RenderDescriptorRangeType::TEXTURE;
+        };
+
+        struct DescriptorSetDenseCache {
+            std::vector<DescriptorSetDenseEntry> activeEntries;
+            bool dirty = true;
+        };
+
         std::mutex g_retiredResourcesMutex;
         std::vector<DeferredMetalResource> g_pendingRetiredResources;
         std::vector<DeferredMetalResource> g_readyRetiredResources;
         std::vector<std::shared_ptr<InFlightRetiredBatch>> g_inFlightRetiredBatches;
         std::unordered_map<const MTL::Resource *, MetalDevice *> g_distinctTextureViewDevices;
+        std::unordered_map<const MetalDescriptorSet *, DescriptorSetDenseCache> g_descriptorDenseCaches;
         std::mutex g_descriptorEntriesMutex;
         std::atomic<bool> g_residencySetDirty{ false };
 
@@ -2283,6 +2294,7 @@ namespace plume {
         MetalAutoreleasePool releasePool;
         {
             std::lock_guard<std::mutex> lock(g_descriptorEntriesMutex);
+            g_descriptorDenseCaches.erase(this);
             for (auto &entry : resourceEntries) {
                 if (entry.resource != nullptr) {
                     deferReleaseMetalResource(device, entry.resource, false, false);
@@ -2455,6 +2467,9 @@ namespace plume {
             oldResource = resourceEntries[descriptorIndex].resource;
             resourceEntries[descriptorIndex].resource = nativeResource;
             resourceEntries[descriptorIndex].type = descriptorType;
+            if (device->residencySet == nullptr && oldResource != nativeResource) {
+                g_descriptorDenseCaches[this].dirty = true;
+            }
         }
         if (oldResource != nullptr) {
             deferReleaseMetalResource(device, oldResource, false, false);
@@ -3943,7 +3958,9 @@ namespace plume {
         if (activeComputeEncoder != nullptr) {
             bindEncoderResources(activeComputeEncoder, true);
             barrierUpdate(MetalBarrierStage::COMPUTE, activeComputeEncoder);
-            activeComputeEncoder->updateFence(timestampQueryFence);
+            if (device->timestampCounterSet != nullptr) {
+                activeComputeEncoder->updateFence(timestampQueryFence);
+            }
             activeComputeEncoder->endEncoding();
             activeComputeEncoder->release();
             activeComputeEncoder = nullptr;
@@ -4147,7 +4164,9 @@ namespace plume {
         if (activeRenderEncoder != nullptr) {
             bindEncoderResources(activeRenderEncoder, false);
             barrierUpdate(MetalBarrierStage::GRAPHICS, activeRenderEncoder);
-            activeRenderEncoder->updateFence(timestampQueryFence, MTL::RenderStageVertex | MTL::RenderStageFragment);
+            if (device->timestampCounterSet != nullptr) {
+                activeRenderEncoder->updateFence(timestampQueryFence, MTL::RenderStageVertex | MTL::RenderStageFragment);
+            }
             activeRenderEncoder->endEncoding();
             activeRenderEncoder->release();
             activeRenderEncoder = nullptr;
@@ -4179,7 +4198,9 @@ namespace plume {
     void MetalCommandList::endActiveBlitEncoder() {
         if (activeBlitEncoder != nullptr) {
             barrierUpdate(MetalBarrierStage::COPY, activeBlitEncoder);
-            activeBlitEncoder->updateFence(timestampQueryFence);
+            if (device->timestampCounterSet != nullptr) {
+                activeBlitEncoder->updateFence(timestampQueryFence);
+            }
             activeBlitEncoder->endEncoding();
             activeBlitEncoder->release();
             activeBlitEncoder = nullptr;
@@ -4207,7 +4228,9 @@ namespace plume {
     void MetalCommandList::endActiveResolveTextureComputeEncoder() {
         if (activeResolveComputeEncoder != nullptr) {
             barrierUpdate(MetalBarrierStage::COPY, activeResolveComputeEncoder);
-            activeResolveComputeEncoder->updateFence(timestampQueryFence);
+            if (device->timestampCounterSet != nullptr) {
+                activeResolveComputeEncoder->updateFence(timestampQueryFence);
+            }
             activeResolveComputeEncoder->endEncoding();
             activeResolveComputeEncoder->release();
             activeResolveComputeEncoder = nullptr;
@@ -4215,6 +4238,12 @@ namespace plume {
     }
 
     void MetalCommandList::bindEncoderResources(MTL::CommandEncoder* encoder, bool isCompute) {
+        // When MTLResidencySet is active on the queue (iOS 18+ on A13 / GPUFamilyApple6+), all buffers,
+        // textures, texture views, formatted buffer views, and argument buffers are already resident globally.
+        if (device->residencySet != nullptr) {
+            return;
+        }
+
         if (isCompute) {
             auto* computeEncoder = static_cast<MTL::ComputeCommandEncoder*>(encoder);
             {
@@ -4233,10 +4262,18 @@ namespace plume {
                     computeEncoder->useResource(descriptorSet->argumentBuffer.mtl, MTL::ResourceUsageRead);
                 }
                 std::lock_guard<std::mutex> entryLock(g_descriptorEntriesMutex);
-                for (const auto& entry : descriptorSet->resourceEntries) {
-                    if (entry.resource != nullptr) {
-                        computeEncoder->useResource(entry.resource, mapResourceUsage(entry.type));
+                auto& cache = g_descriptorDenseCaches[descriptorSet];
+                if (cache.dirty) {
+                    cache.activeEntries.clear();
+                    for (const auto& entry : descriptorSet->resourceEntries) {
+                        if (entry.resource != nullptr) {
+                            cache.activeEntries.push_back({ entry.resource, entry.type });
+                        }
                     }
+                    cache.dirty = false;
+                }
+                for (const auto& entry : cache.activeEntries) {
+                    computeEncoder->useResource(entry.resource, mapResourceUsage(entry.type));
                 }
             }
         } else {
@@ -4249,14 +4286,6 @@ namespace plume {
                     }
                 }
             }
-            for (uint32_t i = 0; i < MAX_VERTEX_BUFFER_BINDINGS; i++) {
-                if (vertexBuffers[i] != nullptr) {
-                    renderEncoder->useResource(vertexBuffers[i], MTL::ResourceUsageRead, MTL::RenderStageVertex);
-                }
-            }
-            if (indexBuffer != nullptr) {
-                renderEncoder->useResource(indexBuffer, MTL::ResourceUsageRead, MTL::RenderStageVertex);
-            }
             for (const auto* descriptorSet : currentEncoderDescriptorSets) {
                 if (descriptorSet == nullptr) {
                     continue;
@@ -4265,10 +4294,18 @@ namespace plume {
                     renderEncoder->useResource(descriptorSet->argumentBuffer.mtl, MTL::ResourceUsageRead, MTL::RenderStageVertex | MTL::RenderStageFragment);
                 }
                 std::lock_guard<std::mutex> entryLock(g_descriptorEntriesMutex);
-                for (const auto& entry : descriptorSet->resourceEntries) {
-                    if (entry.resource != nullptr) {
-                        renderEncoder->useResource(entry.resource, mapResourceUsage(entry.type), MTL::RenderStageVertex | MTL::RenderStageFragment);
+                auto& cache = g_descriptorDenseCaches[descriptorSet];
+                if (cache.dirty) {
+                    cache.activeEntries.clear();
+                    for (const auto& entry : descriptorSet->resourceEntries) {
+                        if (entry.resource != nullptr) {
+                            cache.activeEntries.push_back({ entry.resource, entry.type });
+                        }
                     }
+                    cache.dirty = false;
+                }
+                for (const auto& entry : cache.activeEntries) {
+                    renderEncoder->useResource(entry.resource, mapResourceUsage(entry.type), MTL::RenderStageVertex | MTL::RenderStageFragment);
                 }
             }
         }
@@ -4362,10 +4399,12 @@ namespace plume {
 
         flushDeferredReleases();
 
-        // Ensure any pending MTLResidencySet mutations are committed before enqueuing/committing command buffers.
-        if (device != nullptr && device->residencySet != nullptr && g_residencySetDirty.exchange(false, std::memory_order_acq_rel)) {
+        // Ensure any pending MTLResidencySet mutations are committed atomically before enqueuing/committing command buffers.
+        if (device != nullptr && device->residencySet != nullptr && g_residencySetDirty.load(std::memory_order_acquire)) {
             std::lock_guard lock(device->resourcesMutex);
-            device->residencySet->commit();
+            if (g_residencySetDirty.exchange(false, std::memory_order_acq_rel)) {
+                device->residencySet->commit();
+            }
         }
 
         // Create a new command buffer to encode the wait semaphores into
@@ -4454,7 +4493,6 @@ namespace plume {
     MetalPipelineLayout::~MetalPipelineLayout() {}
 
     void MetalPipelineLayout::bindDescriptorSets(MTL::CommandEncoder* encoder, const MetalDescriptorSet* const* descriptorSets, uint32_t descriptorSetCount, bool isCompute, uint32_t startIndex, std::unordered_set<MetalDescriptorSet*>& encoderDescriptorSets, bool usingResidencySets) const {
-        (void)usingResidencySets;
         for (uint32_t i = startIndex; i < setLayoutCount; i++) {
             if (i >= descriptorSetCount || descriptorSets[i] == nullptr) {
                 continue;
@@ -4463,8 +4501,9 @@ namespace plume {
             const MetalDescriptorSet* descriptorSet = descriptorSets[i];
             const MetalArgumentBuffer& descriptorBuffer = descriptorSet->argumentBuffer;
 
-            // Always track descriptor set so bindEncoderResources marks all active textures & buffers resident via useResource.
-            encoderDescriptorSets.insert(const_cast<MetalDescriptorSet*>(descriptorSet));
+            if (!usingResidencySets) {
+                encoderDescriptorSets.insert(const_cast<MetalDescriptorSet*>(descriptorSet));
+            }
 
             // Bind argument buffer
             if (isCompute) {
@@ -4525,10 +4564,14 @@ namespace plume {
         }
 #endif
 
+#if PLUME_IOS
+        timestampCounterSet = nullptr;
+#else
         timestampCounterSet = findTimestampCounterSet();
         if (timestampCounterSet != nullptr) {
             timestampCounterSet->retain();
         }
+#endif
 
         // Setup blit, clear and resolve shaders / pipelines
         createClearShaderLibrary();
@@ -4941,7 +4984,6 @@ namespace plume {
             std::lock_guard lock(resourcesMutex);
             if (residencySet != nullptr) {
                 residencySet->addAllocation(resource);
-                residencySet->commit();
                 g_residencySetDirty.store(true, std::memory_order_release);
             }
             if (addressable) {
@@ -4958,13 +5000,13 @@ namespace plume {
             std::lock_guard lock(resourcesMutex);
             if (residencySet != nullptr) {
                 residencySet->removeAllocation(resource);
-                residencySet->commit();
                 g_residencySetDirty.store(true, std::memory_order_release);
             }
             if (addressable) {
                 const auto it = std::find(gpuAddressableResources.begin(), gpuAddressableResources.end(), resource);
                 if (it != gpuAddressableResources.end()) {
-                    gpuAddressableResources.erase(it);
+                    *it = gpuAddressableResources.back();
+                    gpuAddressableResources.pop_back();
                 }
             }
         }
