@@ -21,6 +21,9 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <sys/ucontext.h>
+#endif
 #include <unistd.h>
 
 namespace
@@ -109,7 +112,7 @@ namespace
         return pos;
     }
 
-    void WriteFatalSignalFreezeLog(int sig, siginfo_t* info)
+    void WriteFatalSignalFreezeLog(int sig, siginfo_t* info, void* ucontext)
     {
         if (g_fatalSignalLogged.test_and_set(std::memory_order_acq_rel))
             return;
@@ -117,7 +120,26 @@ namespace
         const uintptr_t crashAddr = (info != nullptr) ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
         const uint64_t availBytes = static_cast<uint64_t>(os_proc_available_memory());
 
-        char line[256];
+        uint64_t pcVal = 0;
+        uint64_t lrVal = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (ucontext != nullptr)
+        {
+            const ucontext_t* uc = static_cast<const ucontext_t*>(ucontext);
+            if (uc->uc_mcontext != nullptr)
+            {
+#if defined(__darwin_arm_thread_state64_get_pc)
+                pcVal = static_cast<uint64_t>(__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss));
+                lrVal = static_cast<uint64_t>(__darwin_arm_thread_state64_get_lr(uc->uc_mcontext->__ss));
+#else
+                pcVal = static_cast<uint64_t>(uc->uc_mcontext->__ss.__pc);
+                lrVal = static_cast<uint64_t>(uc->uc_mcontext->__ss.__lr);
+#endif
+            }
+        }
+#endif
+
+        char line[320];
         size_t pos = 0;
         pos = AppendSignalText(line, sizeof(line), pos, "[FATAL SIGNAL] sig=");
         pos = AppendSignalUint(line, sizeof(line), pos, static_cast<uint64_t>(sig > 0 ? sig : 0));
@@ -125,6 +147,10 @@ namespace
         pos = AppendSignalText(line, sizeof(line), pos, GetFatalSignalName(sig));
         pos = AppendSignalText(line, sizeof(line), pos, ") si_addr=");
         pos = AppendSignalHex(line, sizeof(line), pos, static_cast<uint64_t>(crashAddr));
+        pos = AppendSignalText(line, sizeof(line), pos, " pc=");
+        pos = AppendSignalHex(line, sizeof(line), pos, pcVal);
+        pos = AppendSignalText(line, sizeof(line), pos, " lr=");
+        pos = AppendSignalHex(line, sizeof(line), pos, lrVal);
         pos = AppendSignalText(line, sizeof(line), pos, " avail_ram=");
         pos = AppendSignalUint(line, sizeof(line), pos, availBytes / MiB);
         pos = AppendSignalText(line, sizeof(line), pos, " MiB (");
@@ -188,7 +214,7 @@ namespace
             }
         }
 
-        WriteFatalSignalFreezeLog(sig, info);
+        WriteFatalSignalFreezeLog(sig, info, ucontext);
 
         const struct sigaction& prev = (sig == SIGBUS)
             ? g_prevSigbusAction
