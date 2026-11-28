@@ -579,20 +579,16 @@ PPC_FUNC(sub_82733640)
 PPC_FUNC_IMPL(__imp__sub_827441B8);
 PPC_FUNC(sub_827441B8)
 {
-    const uint32_t ptr = ctx.r3.u32;
-    if (base == nullptr || ptr < 0x10000u || ptr >= 0xF0000000u)
-    {
-        ctx.r3.u32 = 0;
-        return;
-    }
-
-    if (g_xmvAbortRequested.load(std::memory_order_acquire) ||
+    if (base == nullptr ||
+        ctx.r3.u32 == 0 ||
+        ctx.r3.u32 < 0x10000u ||
+        ctx.r3.u32 >= 0xF0000000u ||
+        g_xmvAbortRequested.load(std::memory_order_acquire) ||
         g_xmvAbortedPlayer.load(std::memory_order_acquire) != 0 ||
         XmvNowMs() < g_xmvAbortDrainUntilMs.load(std::memory_order_acquire))
     {
-        ctx.r3.u32 = 0;
+        ctx.r3.u64 = 0;
         return;
     }
-
     __imp__sub_827441B8(ctx, base);
 }
