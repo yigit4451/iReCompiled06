@@ -4633,6 +4633,7 @@ namespace plume {
         nullBuffer.reset();
 
         std::vector<DeferredMetalResource> pendingToFlush;
+        std::vector<MTL::CommandBuffer *> cmdBuffersToRelease;
         {
             std::lock_guard<std::mutex> lock(g_retiredResourcesMutex);
             auto drainList = [this, &pendingToFlush](std::vector<DeferredMetalResource> &list) {
@@ -4646,14 +4647,36 @@ namespace plume {
                     }
                 }
             };
-            drainList(g_readyRetiredResources);
-            drainList(g_stagingRetiredResources);
+            drainList(g_pendingRetiredResources);
+            auto batchIt = g_inFlightRetiredBatches.begin();
+            while (batchIt != g_inFlightRetiredBatches.end()) {
+                if (*batchIt != nullptr) {
+                    drainList((*batchIt)->resources);
+                    if ((*batchIt)->resources.empty()) {
+                        if ((*batchIt)->commandBuffer != nullptr) {
+                            cmdBuffersToRelease.push_back((*batchIt)->commandBuffer);
+                            (*batchIt)->commandBuffer = nullptr;
+                        }
+                        batchIt = g_inFlightRetiredBatches.erase(batchIt);
+                        continue;
+                    }
+                }
+                ++batchIt;
+            }
+        }
+        for (MTL::CommandBuffer *cb : cmdBuffersToRelease) {
+            if (cb != nullptr) {
+                cb->release();
+            }
         }
         for (const auto &item : pendingToFlush) {
             if (item.registeredOnDevice && item.device == this) {
                 removeResource(item.resource, item.addressable);
             }
             if (item.resource != nullptr) {
+                if (item.canPurge && item.resource->retainCount() <= 1) {
+                    item.resource->setPurgeableState(MTL::PurgeableStateEmpty);
+                }
                 item.resource->release();
             }
         }
